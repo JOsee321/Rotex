@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -39,6 +40,44 @@ type mockBackend struct {
 type mockIAMKey struct {
 	id     string
 	status string
+}
+
+type backendSnapshot struct {
+	createCalls     int
+	putCalls        int
+	stsCalls        int
+	deactivatedKeys []string
+	deletedKeys     []string
+	decryptedValues map[string]string
+}
+
+func (m *mockBackend) snapshot() backendSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	decrypted := make(map[string]string, len(m.decryptedValues))
+	for k, v := range m.decryptedValues {
+		decrypted[k] = v
+	}
+	return backendSnapshot{
+		createCalls:     m.createCalls,
+		putCalls:        m.putCalls,
+		stsCalls:        m.stsCalls,
+		deactivatedKeys: slices.Clone(m.deactivatedKeys),
+		deletedKeys:     slices.Clone(m.deletedKeys),
+		decryptedValues: decrypted,
+	}
+}
+
+func (m *mockBackend) reset(failPutRepo string, keys ...mockIAMKey) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.failPutRepo = failPutRepo
+	m.iamKeys = slices.Clone(keys)
+	m.deactivatedKeys = nil
+	m.deletedKeys = nil
+	return m.createCalls
 }
 
 func newMockBackend(t *testing.T) *mockBackend {
@@ -322,7 +361,8 @@ func TestRotexCLIEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("e2e rotate --dry-run failed: %v\nstderr: %s", err, stderr)
 	}
-	if backend.createCalls != 0 || backend.putCalls != 0 {
+	snap := backend.snapshot()
+	if snap.createCalls != 0 || snap.putCalls != 0 {
 		t.Fatalf("dry-run must not mutate APIs")
 	}
 
@@ -340,8 +380,9 @@ func TestRotexCLIEndToEnd(t *testing.T) {
 	if runState.Stage != rotate.StageCompleted || !runState.OldDeactivated || runState.NewKeyID != "AKIA_MINTED_NEW" {
 		t.Fatalf("unexpected rotate state: %+v", runState)
 	}
-	if backend.stsCalls == 0 || backend.decryptedValues["acme/web:AWS_SECRET_ACCESS_KEY"] != "e2eSecretAccessKeyValueDoNotLeak" {
-		t.Fatalf("expected STS verify and sealed box decryption match, sts=%d", backend.stsCalls)
+	snap = backend.snapshot()
+	if snap.stsCalls == 0 || snap.decryptedValues["acme/web:AWS_SECRET_ACCESS_KEY"] != "e2eSecretAccessKeyValueDoNotLeak" {
+		t.Fatalf("expected STS verify and sealed box decryption match, sts=%d", snap.stsCalls)
 	}
 	rawJournal, err := os.ReadFile(filepath.Join(stateDir, runState.RunID+".json"))
 	if err != nil || strings.Contains(string(rawJournal), "e2eSecretAccessKeyValueDoNotLeak") {
@@ -359,12 +400,7 @@ func TestRotexCLIEndToEnd(t *testing.T) {
 	}
 
 	// 6. Mid-flight partial injection failure preserves BOTH old and new active keys to avoid breaking updated repos.
-	backend.mu.Lock()
-	backend.iamKeys = []mockIAMKey{{id: "AKIA_OLD_ACTIVE", status: "Active"}}
-	backend.failPutRepo = "acme/web"
-	backend.deactivatedKeys = nil
-	backend.deletedKeys = nil
-	backend.mu.Unlock()
+	backend.reset("acme/web", mockIAMKey{id: "AKIA_OLD_ACTIVE", status: "Active"})
 
 	stdout, _, err = runCLI(t, binPath, srv.URL, nil,
 		"rotate", "--iam-user", "ci-deployer", "--repo", "acme/api", "--repo", "acme/web",
@@ -379,8 +415,9 @@ func TestRotexCLIEndToEnd(t *testing.T) {
 	if partialState.Stage != rotate.StageFailedRecoverable || partialState.NewDeleted || partialState.OldDeactivated {
 		t.Fatalf("expected partial failure to keep both keys active in FAILED_RECOVERABLE, got: %+v", partialState)
 	}
-	if len(backend.deactivatedKeys) != 0 || len(backend.deletedKeys) != 0 {
-		t.Fatalf("neither key must be deactivated or deleted after partial injection: deactivated=%v deleted=%v", backend.deactivatedKeys, backend.deletedKeys)
+	snap = backend.snapshot()
+	if len(snap.deactivatedKeys) != 0 || len(snap.deletedKeys) != 0 {
+		t.Fatalf("neither key must be deactivated or deleted after partial injection: deactivated=%v deleted=%v", snap.deactivatedKeys, snap.deletedKeys)
 	}
 
 	// Clean up minted key before testing 2-key guard cleanly.
@@ -391,12 +428,7 @@ func TestRotexCLIEndToEnd(t *testing.T) {
 	}
 
 	// 6b. Pre-mutation injection failure (first target fails) triggers automatic rollback deleting NewKeyID.
-	backend.mu.Lock()
-	backend.iamKeys = []mockIAMKey{{id: "AKIA_OLD_ACTIVE", status: "Active"}}
-	backend.failPutRepo = "acme/api"
-	backend.deactivatedKeys = nil
-	backend.deletedKeys = nil
-	backend.mu.Unlock()
+	backend.reset("acme/api", mockIAMKey{id: "AKIA_OLD_ACTIVE", status: "Active"})
 
 	stdout, _, err = runCLI(t, binPath, srv.URL, nil,
 		"rotate", "--iam-user", "ci-deployer", "--repo", "acme/api", "--repo", "acme/web",
@@ -411,36 +443,28 @@ func TestRotexCLIEndToEnd(t *testing.T) {
 	if rolledState.Stage != rotate.StageRolledBack || !rolledState.NewDeleted {
 		t.Fatalf("expected automatic rollback to ROLLED_BACK when 0 secrets were mutated, got: %+v", rolledState)
 	}
-	if len(backend.deactivatedKeys) != 0 {
-		t.Fatalf("old key must not be deactivated on failed injection: %v", backend.deactivatedKeys)
+	snap = backend.snapshot()
+	if len(snap.deactivatedKeys) != 0 {
+		t.Fatalf("old key must not be deactivated on failed injection: %v", snap.deactivatedKeys)
 	}
 
 	// 7. 2-key AWS quota guard aborts before minting.
-	backend.mu.Lock()
-	backend.failPutRepo = ""
-	backend.iamKeys = []mockIAMKey{
-		{id: "AKIA_1", status: "Active"},
-		{id: "AKIA_2", status: "Inactive"},
-	}
-	prevCreate := backend.createCalls
-	backend.mu.Unlock()
+	prevCreate := backend.reset("",
+		mockIAMKey{id: "AKIA_1", status: "Active"},
+		mockIAMKey{id: "AKIA_2", status: "Inactive"},
+	)
 
 	_, stderr, err = runCLI(t, binPath, srv.URL, nil,
 		"rotate", "--iam-user", "ci-deployer", "--repo", "acme/api", "--apply", "--state-dir", stateDir)
 	if err == nil || !strings.Contains(stderr, "2/2") {
 		t.Fatalf("expected 2/2 quota error on stderr, got err=%v stderr=%s", err, stderr)
 	}
-	if backend.createCalls != prevCreate {
+	if snap := backend.snapshot(); snap.createCalls != prevCreate {
 		t.Fatalf("2-key guard must abort before calling CreateAccessKey")
 	}
 
 	// 8. Manual rollback on a completed run restores old key and deletes new key.
-	backend.mu.Lock()
-	backend.failPutRepo = ""
-	backend.iamKeys = []mockIAMKey{{id: "AKIA_OLD_ACTIVE", status: "Active"}}
-	backend.deactivatedKeys = nil
-	backend.deletedKeys = nil
-	backend.mu.Unlock()
+	backend.reset("", mockIAMKey{id: "AKIA_OLD_ACTIVE", status: "Active"})
 
 	stdout, stderr, err = runCLI(t, binPath, srv.URL, nil,
 		"rotate", "--iam-user", "ci-deployer", "--repo", "acme/api",
