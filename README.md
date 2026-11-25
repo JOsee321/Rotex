@@ -3,7 +3,40 @@
 **Local-first, zero-knowledge CLI to map GitHub Actions secret blast radius and safely rotate credentials in-place.**
 
 [![CI](https://github.com/JOsee321/Rotex/actions/workflows/ci.yml/badge.svg)](https://github.com/JOsee321/Rotex/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/badge/status-v0.1.0--beta-orange)](#security-model--known-limitations)
 [![License](https://img.shields.io/github/license/JOsee321/Rotex)](LICENSE)
+
+```text
+$ rotex scan --repo cli/cli --format table --no-color
+Rotex Exposure Scan (repo:cli/cli)
+Repos scanned: 1 | Skipped: 0 | Workflows parsed: 15 | Unique secrets: 21 | Risky: 0 | Warnings: 2
+
+SECRET NAME                                           SCOPES  REPOS    WORKFLOWS  AGE (DAYS)  RISK FLAGS
+CLI_TRIAGE_APP_CLIENT_ID                              -       cli/cli  2          -           none
+CLI_TRIAGE_APP_PRIVATE_KEY                            -       cli/cli  2          -           none
+GATEWATCHER_APP_STORE_CONNECT_API_BASE64_PRIVATE_KEY  -       cli/cli  1          -           none
+... (21 secrets mapped across 15 workflows) ...
+
+Warnings:
+- [unauthenticated] github (auth): GITHUB_TOKEN not set; running unauthenticated (60 req/hr limit, secret metadata inaccessible)
+- [unauthorized] cli/cli (repo): unable to read repository secrets: github API /repos/cli/cli/actions/secrets?per_page=100 returned HTTP 401: Requires authentication
+```
+
+---
+
+## Try in 10 Seconds (No Token Required)
+
+You can audit public GitHub repositories immediately without configuring any token (60 req/hr unauthenticated GitHub rate limit; secret metadata endpoints degrade gracefully with clear warnings):
+
+```bash
+go install github.com/JOsee321/Rotex/cmd/rotex@latest
+
+# Map workflow secret references & risky triggers on any public repo
+rotex scan --repo cli/cli --no-color
+
+# Check whether a compromised dependency affects lockfiles & recent workflow runs
+rotex blast --repo spf13/cobra --pkg github.com/spf13/pflag --since 72h --no-color
+```
 
 ---
 
@@ -18,16 +51,11 @@ Modern engineering teams store long-lived credentials (`AWS_ACCESS_KEY_ID`, `NPM
 
 ---
 
-## Core Security Guarantees
+## Core Capabilities
 
-- **Zero-Knowledge & Local-First:** Direct HTTPS calls from your local machine to GitHub and cloud provider APIs. No Rotex backend server exists.
-- **Read-Only by Default:** `rotex scan` and `rotex blast` only require read-only metadata scopes. Write operations require explicit `--apply` on `rotex rotate`.
-- **Safe Dual-Key State Machine:** New credentials are minted, verified (e.g., via `sts:GetCallerIdentity`), encrypted locally with **Libsodium Sealed Box (`crypto_box_seal`)**, and injected into GitHub Actions Secrets *before* the old key is deactivated.
-- **Automatic Rollback & Memory Hygiene:** Pre-injection verification/setup failures automatically delete newly minted uninjected keys, while partial-injection failures preserve both active keys to prevent downtime. Secret buffers are wrapped in redacted types (`[REDACTED]`) and zeroed in memory immediately after encryption.
-
----
-
-## Architecture
+1. **Exposure Mapping (`rotex scan`):** Discovers Org/Repo/Environment secret metadata, parses `.github/workflows/*.yml` and `.yaml` ASTs, flags `pull_request_target`, `workflow_run`, unpinned third-party actions, `secrets: inherit`, stale secrets (>90 days), and correlates read-only AWS IAM + CloudTrail usage (`--with-aws`).
+2. **Incident Mode (`rotex blast`):** Scans lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `go.sum`, `requirements.txt`, `poetry.lock`) against `--pkg` or OSV/JSON advisories (`--advisory`), checks workflow runs in the incident window (`--since 72h`), and ranks exposed secrets by blast radius priority.
+3. **Safe In-Place Rotation (`rotex rotate`):** Runs a 6-stage dual-key state machine (`PREFLIGHT` -> `MINT` -> `INJECT` -> `VERIFY` -> `DEACTIVATE` -> optional `REVOKE`) using **Libsodium Sealed Box (`crypto_box_seal`)** client-side encryption, AWS IAM 2-key quota preflight guards, `sts:GetCallerIdentity` verification with exponential backoff, and automatic rollback on failure.
 
 ```text
 +-------------------------------------------------------------------+
@@ -57,110 +85,87 @@ Modern engineering teams store long-lived credentials (`AWS_ACCESS_KEY_ID`, `NPM
 
 ---
 
-## Installation
+## Usage Examples
 
-### From Source (Go 1.23+)
-
-```bash
-go install github.com/JOsee321/Rotex/cmd/rotex@latest
-```
-
-### Build Locally
-
-```bash
-git clone https://github.com/JOsee321/Rotex.git
-cd Rotex
-go build -o rotex ./cmd/rotex
-```
-
-Prebuilt cross-platform binaries (Linux, macOS, Windows) and SHA-256 checksums are published on [GitHub Releases](https://github.com/JOsee321/Rotex/releases).
-
----
-
-## Quickstart
-
-Set a read-only GitHub token first:
+Set a GitHub token for private repositories, secret metadata (`updated_at`), and rotation:
 
 ```bash
 export GITHUB_TOKEN="github_pat_..."
 ```
 
-### 1. Map Secret Exposure (`rotex scan`)
-
-Scan an entire organization (skips archived repositories by default, degrades gracefully on HTTP 403 org/environment permission boundaries):
+### 1. Organization & AWS Exposure Scan
 
 ```bash
+# Scan an entire org (skips archived repos by default; degrades gracefully on HTTP 403)
 rotex scan --org my-org
-```
 
-Scan a single repository without org-level permissions:
+# Include AWS IAM credential age, zombie keys, overprivileged policies, and CloudTrail runner usage
+rotex scan --org my-org --with-aws --format table
 
-```bash
+# Export machine-readable JSON or Markdown for audit reports
+rotex scan --org my-org --format json > exposure-report.json
 rotex scan --repo owner/repo --format markdown
 ```
 
-Correlate GitHub secrets with read-only AWS IAM key age, unused zombie keys, overprivileged policies, and CloudTrail runner usage:
-
-```bash
-rotex scan --org my-org --with-aws --format table
-```
-
-Example output:
-
-```text
-Rotex Exposure Scan (org:my-org)
-Repos scanned: 12 | Skipped: 2 | Workflows parsed: 28 | Unique secrets: 4 | Risky: 3 | Warnings: 0
-
-SECRET NAME            SCOPES    REPOS                     WORKFLOWS  AGE (DAYS)  RISK FLAGS
-AWS_ACCESS_KEY_ID      repo      my-org/api, my-org/web    4          142         aws_overprivileged,aws_stale_key,pull_request_target,stale_secret,unpinned_action
-AWS_SECRET_ACCESS_KEY  repo      my-org/api, my-org/web    4          142         aws_overprivileged,aws_stale_key,pull_request_target,stale_secret,unpinned_action
-NPM_TOKEN              org       my-org/sdk                2          45          secrets_inherit
-```
-
-### 2. Incident Blast Radius Mode (`rotex blast`)
-
-When a package is compromised (e.g., an npm worm or OSV advisory), find every affected repository across lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `go.sum`, `requirements.txt`, `poetry.lock`), inspect workflow runs in the incident window, and prioritize which secrets to rotate first:
+### 2. Incident Blast Radius
 
 ```bash
 rotex blast --org my-org --pkg "compromised-pkg@1.2.3" --since 72h
+rotex blast --org my-org --advisory ./osv-advisory.json --format json
 ```
 
-Or pass an OSV/JSON advisory file:
+### 3. Safe In-Place AWS -> GitHub Rotation
 
 ```bash
-rotex blast --org my-org --advisory ./advisory.json --format json
-```
-
-### 3. Safe In-Place Rotation (`rotex rotate`)
-
-Preview a deterministic dry-run execution plan first (default behavior when `--apply` is omitted):
-
-```bash
+# Always preview the deterministic dry-run plan first (also the default when --apply is omitted)
 rotex rotate \
   --iam-user ci-deployer \
   --repo my-org/api \
   --repo my-org/web \
   --env my-org/web:production \
   --dry-run
-```
 
-Apply rotation across all targets (enforces AWS IAM's 2-key quota preflight check, encrypts secrets locally via `golang.org/x/crypto/nacl/box`, verifies via `sts:GetCallerIdentity`, and deactivates the old key while keeping a grace window):
-
-```bash
+# Apply dual-key rotation with STS verification and 24h deactivation grace window
 rotex rotate \
   --iam-user ci-deployer \
   --repo my-org/api \
   --repo my-org/web \
   --env my-org/web:production \
   --apply
-```
 
-Roll back a rotation run if needed, or permanently delete the deactivated old key after your grace window:
-
-```bash
+# Roll back or permanently delete the old key after the grace window
 rotex rollback --run-id rot-20261125-120000-ab12cd34
 rotex cleanup  --run-id rot-20261125-120000-ab12cd34
 ```
+
+---
+
+## Installation
+
+- **Go Install (Go 1.23+):**
+  ```bash
+  go install github.com/JOsee321/Rotex/cmd/rotex@latest
+  ```
+- **Prebuilt Binaries:** Download archives and `checksums.txt` for Linux, macOS, and Windows from [GitHub Releases](https://github.com/JOsee321/Rotex/releases).
+- **Build from Source:**
+  ```bash
+  git clone https://github.com/JOsee321/Rotex.git
+  cd Rotex
+  go build -o rotex ./cmd/rotex
+  ```
+
+---
+
+## Security Model & Known Limitations
+
+Rotex is currently in **Public Beta (`v0.1.0-beta`)**. Please review the following security boundaries before running write operations against production environments:
+
+1. **Always Run `--dry-run` First:** `rotex scan` and `rotex blast` are strictly read-only, whereas `rotex rotate --apply` mutates AWS IAM access keys and GitHub Actions Secrets. Always review `rotex rotate --dry-run` before running `--apply`.
+2. **Go Immutable `string` Memory Limitation:** Rotex wraps credential buffers in `SensitiveBytes` and explicitly clears byte slices (`WipeBytes` / `clear`) immediately after encryption. However, third-party HTTP/SDK layers (`net/http`, `aws-sdk-go-v2`) allocate standard Go `string` values (for example, AWS XML/SigV4 payloads) that are immutable in the Go runtime and cannot be deterministically zeroed before garbage collection.
+3. **External TOCTOU on AWS 2-Key Quota:** `PREFLIGHT` verifies that the target IAM user has fewer than 2 access keys before minting. If an external operator or automation creates a second access key in the AWS Console between `PREFLIGHT` and `MINT`, AWS IAM rejects `CreateAccessKey` with `LimitExceeded` and `rotex` aborts safely without modifying any GitHub Secrets.
+4. **Local State Journal:** `.rotex/state/<run-id>.json` stores metadata and key IDs only (`AKIA...`), never raw secret values, and is written with `0600` permissions.
+
+For vulnerability reporting, see [SECURITY.md](SECURITY.md).
 
 ---
 
