@@ -177,17 +177,18 @@ func runRotate(cmd *cobra.Command, deps Dependencies, opts *rotateOptions, noCol
 	if !opts.apply {
 		plan, planErr := engine.Plan(cmd.Context(), req)
 		if planErr != nil {
-			return security.SanitizeError(planErr, token.Expose())
+			return sanitizeCLIError(planErr, deps.LookupEnv, token.Expose())
 		}
 		return output.RenderRotationPlan(cmd.OutOrStdout(), plan, outOpts)
 	}
 
 	state, applyErr := engine.Apply(cmd.Context(), req)
 	if state != nil {
+		sanitizeRunStateSecrets(state, deps.LookupEnv, token.Expose())
 		_ = output.RenderRunState(cmd.OutOrStdout(), state, outOpts)
 	}
 	if applyErr != nil {
-		return security.SanitizeError(applyErr, token.Expose())
+		return sanitizeCLIError(applyErr, deps.LookupEnv, token.Expose())
 	}
 	return nil
 }
@@ -206,7 +207,7 @@ func runLifecycleAction(cmd *cobra.Command, deps Dependencies, opts *runIDOption
 
 	provider, err := deps.AWSRotatorFactory(cmd.Context(), iamEP, stsEP, 30*time.Second, time.Second)
 	if err != nil {
-		return err
+		return sanitizeCLIError(err, deps.LookupEnv)
 	}
 
 	engine := rotate.NewEngine(provider, nil, rotate.WithJournal(rotate.NewJournal(opts.stateDir)))
@@ -217,25 +218,29 @@ func runLifecycleAction(cmd *cobra.Command, deps Dependencies, opts *runIDOption
 		state, err = engine.Cleanup(cmd.Context(), opts.runID)
 	}
 	if err != nil {
-		return err
+		return sanitizeCLIError(err, deps.LookupEnv)
 	}
 
+	sanitizeRunStateSecrets(state, deps.LookupEnv)
 	disableColor := (noColor != nil && *noColor) || deps.LookupEnv("NO_COLOR") != ""
 	return output.RenderRunState(cmd.OutOrStdout(), state, output.Options{Format: format, NoColor: disableColor})
 }
 
 func buildStoreTargets(org string, repos, envs []string) ([]rotate.StoreScope, error) {
 	var targets []rotate.StoreScope
-	if strings.TrimSpace(org) != "" {
-		targets = append(targets, rotate.StoreScope{Scope: model.ScopeOrg, Org: strings.TrimSpace(org)})
+	if trimmedOrg := strings.TrimSpace(org); trimmedOrg != "" {
+		if trimmedOrg == "." || trimmedOrg == ".." || strings.ContainsAny(trimmedOrg, `/\`) {
+			return nil, fmt.Errorf("invalid --org %q", org)
+		}
+		targets = append(targets, rotate.StoreScope{Scope: model.ScopeOrg, Org: trimmedOrg})
 	}
 	for _, r := range repos {
 		r = strings.TrimSpace(r)
 		if r == "" {
 			continue
 		}
-		if owner, name, ok := strings.Cut(r, "/"); !ok || owner == "" || name == "" {
-			return nil, fmt.Errorf("invalid --repo %q: expected owner/name", r)
+		if err := validateRepoFlag(r); err != nil {
+			return nil, fmt.Errorf("invalid --repo %q: %w", r, err)
 		}
 		targets = append(targets, rotate.StoreScope{Scope: model.ScopeRepo, Repo: r})
 	}
@@ -245,12 +250,57 @@ func buildStoreTargets(org string, repos, envs []string) ([]rotate.StoreScope, e
 			continue
 		}
 		repoPart, envName, ok := strings.Cut(e, ":")
-		if !ok || repoPart == "" || envName == "" {
+		if !ok || strings.TrimSpace(envName) == "" {
 			return nil, fmt.Errorf("invalid --env %q: expected owner/name:environment", e)
 		}
-		targets = append(targets, rotate.StoreScope{Scope: model.ScopeEnvironment, Repo: repoPart, Environment: envName})
+		if err := validateRepoFlag(repoPart); err != nil {
+			return nil, fmt.Errorf("invalid --env %q: %w", e, err)
+		}
+		envTrimmed := strings.TrimSpace(envName)
+		if envTrimmed == "." || envTrimmed == ".." || strings.ContainsAny(envTrimmed, `/\`) {
+			return nil, fmt.Errorf("invalid --env %q: invalid environment name", e)
+		}
+		targets = append(targets, rotate.StoreScope{Scope: model.ScopeEnvironment, Repo: repoPart, Environment: envTrimmed})
 	}
 	return targets, nil
+}
+
+func validateRepoFlag(repo string) error {
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		return errors.New("expected owner/name")
+	}
+	if owner == "." || owner == ".." || name == "." || name == ".." || strings.ContainsAny(repo, `\ `) {
+		return errors.New("invalid repository path segment")
+	}
+	return nil
+}
+
+func collectEnvSecrets(lookup func(string) string, extra ...string) []string {
+	secrets := append([]string{}, extra...)
+	if lookup != nil {
+		for _, k := range []string{"GITHUB_TOKEN", "GH_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"} {
+			if v := strings.TrimSpace(lookup(k)); v != "" {
+				secrets = append(secrets, v)
+			}
+		}
+	}
+	return secrets
+}
+
+func sanitizeCLIError(err error, lookup func(string) string, extra ...string) error {
+	return security.SanitizeError(err, collectEnvSecrets(lookup, extra...)...)
+}
+
+func sanitizeRunStateSecrets(state *rotate.RunState, lookup func(string) string, extra ...string) {
+	if state == nil {
+		return
+	}
+	secrets := collectEnvSecrets(lookup, extra...)
+	state.Error = security.SanitizeString(state.Error, secrets...)
+	for i := range state.Targets {
+		state.Targets[i].Error = security.SanitizeString(state.Targets[i].Error, secrets...)
+	}
 }
 
 func defaultRotatorFactory(ctx context.Context, iamEP, stsEP string, verifyTimeout, verifyBackoff time.Duration) (rotate.CredentialProvider, error) {

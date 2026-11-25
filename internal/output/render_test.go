@@ -186,3 +186,34 @@ func TestRenderRotationPlanAndState(t *testing.T) {
 		t.Fatalf("unexpected state output:\n%s", stateBuf.String())
 	}
 }
+
+func TestRenderSanitizesANSIAndControlChars(t *testing.T) {
+	report := &model.ScanReport{
+		Target:      model.ScanTarget{Org: "acme"},
+		GeneratedAt: time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC),
+		Warnings: []model.ScanWarning{
+			{
+				Scope:   "workflow",
+				Target:  "acme/evil|repo",
+				Code:    "parse_error",
+				Message: "bad\x1b[31mANSI\x1b]2;pwned\x07\nline",
+			},
+		},
+	}
+
+	var tableBuf bytes.Buffer
+	if err := Render(&tableBuf, report, Options{Format: FormatTable, NoColor: true}); err != nil {
+		t.Fatalf("Render table failed: %v", err)
+	}
+	if strings.Contains(tableBuf.String(), "\x1b") || strings.Contains(tableBuf.String(), "\x07") {
+		t.Fatalf("table output leaked terminal escape characters: %q", tableBuf.String())
+	}
+
+	var mdBuf bytes.Buffer
+	if err := Render(&mdBuf, report, Options{Format: FormatMarkdown}); err != nil {
+		t.Fatalf("Render markdown failed: %v", err)
+	}
+	if strings.Contains(mdBuf.String(), "\x1b") || !strings.Contains(mdBuf.String(), `acme/evil\|repo`) {
+		t.Fatalf("markdown output unsafe or unescaped: %q", mdBuf.String())
+	}
+}

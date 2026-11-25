@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/JOsee321/Rotex/internal/model"
 )
+
+var ansiEscapeRe = regexp.MustCompile(`\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])`)
 
 // Format identifies a supported report output format.
 type Format string
@@ -95,9 +98,9 @@ func renderTable(w io.Writer, report *model.ScanReport, noColor bool) error {
 				flags = colorizeRisk(flags, exp.RiskFlags)
 			}
 			if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\n",
-				exp.SecretName,
+				sanitizeText(exp.SecretName),
 				formatScopes(exp.Scopes),
-				formatRepos(exp.Repos),
+				sanitizeText(formatRepos(exp.Repos)),
 				uniqueWorkflowCount(exp.WorkflowRefs),
 				formatAge(exp),
 				flags,
@@ -128,7 +131,7 @@ func renderTable(w io.Writer, report *model.ScanReport, noColor bool) error {
 				svcName = "-"
 			}
 			if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%t\t%t\t%s\n",
-				k.IAMUser, k.AccessKeyID, k.Status, k.AgeDays, svcName, k.GitHubRunnerSeen, k.ExternalUsageSeen, flags,
+				sanitizeText(k.IAMUser), sanitizeText(k.AccessKeyID), sanitizeText(k.Status), k.AgeDays, sanitizeText(svcName), k.GitHubRunnerSeen, k.ExternalUsageSeen, sanitizeText(flags),
 			); err != nil {
 				return err
 			}
@@ -143,7 +146,7 @@ func renderTable(w io.Writer, report *model.ScanReport, noColor bool) error {
 			return err
 		}
 		for _, warn := range report.Warnings {
-			if _, err := fmt.Fprintf(w, "- [%s] %s (%s): %s\n", warn.Code, warn.Target, warn.Scope, warn.Message); err != nil {
+			if _, err := fmt.Fprintf(w, "- [%s] %s (%s): %s\n", sanitizeText(warn.Code), sanitizeText(warn.Target), sanitizeText(warn.Scope), sanitizeText(warn.Message)); err != nil {
 				return err
 			}
 		}
@@ -221,7 +224,8 @@ func renderMarkdown(w io.Writer, report *model.ScanReport) error {
 			return err
 		}
 		for _, warn := range report.Warnings {
-			if _, err := fmt.Fprintf(w, "- `%s` (`%s` / `%s`): %s\n", warn.Code, warn.Scope, warn.Target, warn.Message); err != nil {
+			if _, err := fmt.Fprintf(w, "- `%s` (`%s` / `%s`): %s\n",
+				escapeMD(warn.Code), escapeMD(warn.Scope), escapeMD(warn.Target), escapeMD(warn.Message)); err != nil {
 				return err
 			}
 		}
@@ -296,5 +300,30 @@ func colorizeRisk(text string, flags []model.RiskFlag) string {
 }
 
 func escapeMD(s string) string {
-	return strings.ReplaceAll(s, "|", `\|`)
+	clean := sanitizeText(s)
+	clean = strings.ReplaceAll(clean, "|", `\|`)
+	clean = strings.ReplaceAll(clean, "`", "\\`")
+	return clean
+}
+
+// sanitizeText strips ANSI escape sequences and control characters from untrusted
+// repository/API metadata before printing to a terminal or Markdown report.
+func sanitizeText(s string) string {
+	if s == "" {
+		return ""
+	}
+	s = ansiEscapeRe.ReplaceAllString(s, "")
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			b.WriteByte(' ')
+		case r < 0x20 || r == 0x7f:
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }

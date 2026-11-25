@@ -293,14 +293,18 @@ func (s *stubRotator) MintKey(_ context.Context, _ rotate.KeyTarget) (*rotate.Se
 		},
 	}, nil
 }
-func (s *stubRotator) VerifyKey(_ context.Context, _ *rotate.SecretMaterial) error        { return nil }
-func (s *stubRotator) DeactivateKey(_ context.Context, _ rotate.KeyTarget, _ string) error { return nil }
-func (s *stubRotator) ReactivateKey(_ context.Context, _ rotate.KeyTarget, _ string) error { return nil }
-func (s *stubRotator) DeleteKey(_ context.Context, _ rotate.KeyTarget, _ string) error     { return nil }
+func (s *stubRotator) VerifyKey(_ context.Context, _ *rotate.SecretMaterial) error { return nil }
+func (s *stubRotator) DeactivateKey(_ context.Context, _ rotate.KeyTarget, _ string) error {
+	return nil
+}
+func (s *stubRotator) ReactivateKey(_ context.Context, _ rotate.KeyTarget, _ string) error {
+	return nil
+}
+func (s *stubRotator) DeleteKey(_ context.Context, _ rotate.KeyTarget, _ string) error { return nil }
 
 type stubSecretStore struct{}
 
-func (s *stubSecretStore) Name() string                                             { return "stub-gh" }
+func (s *stubSecretStore) Name() string                                                { return "stub-gh" }
 func (s *stubSecretStore) PreflightScope(_ context.Context, _ rotate.StoreScope) error { return nil }
 func (s *stubSecretStore) UpdateSecret(_ context.Context, _ rotate.StoreScope, _ string, _ *security.SensitiveBytes) error {
 	return nil
@@ -369,5 +373,18 @@ func TestRotateDryRunApplyRollbackCleanupCommands(t *testing.T) {
 	var cleaned rotate.RunState
 	if err := json.Unmarshal(cleanOut.Bytes(), &cleaned); err != nil || cleaned.Stage != rotate.StageRevoked {
 		t.Fatalf("unexpected cleanup result: %+v, err=%v", cleaned, err)
+	}
+
+	// Reject path traversal / malformed targets and scrub token from stdout RunState errors.
+	badTargetCmd := NewRootCommandWithDeps(deps)
+	badTargetCmd.SetArgs([]string{"rotate", "--iam-user", "ci-bot", "--repo", "acme/..", "--dry-run"})
+	if err := badTargetCmd.Execute(); err == nil {
+		t.Fatalf("expected --repo acme/.. to be rejected")
+	}
+
+	badEnvCmd := NewRootCommandWithDeps(deps)
+	badEnvCmd.SetArgs([]string{"rotate", "--iam-user", "ci-bot", "--env", "badrepo:prod", "--dry-run"})
+	if err := badEnvCmd.Execute(); err == nil {
+		t.Fatalf("expected --env badrepo:prod to be rejected")
 	}
 }

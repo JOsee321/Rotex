@@ -72,7 +72,7 @@ func runScan(cmd *cobra.Command, deps Dependencies, opts *scanOptions, noColor *
 	if opts.withAWS {
 		insp, awsErr := deps.AWSInspectorFactory(cmd.Context())
 		if awsErr != nil {
-			return awsErr
+			return sanitizeCLIError(awsErr, deps.LookupEnv, token.Expose())
 		}
 		scannerOpts = append(scannerOpts, scanner.WithAWSInspector(insp))
 	}
@@ -87,7 +87,7 @@ func runScan(cmd *cobra.Command, deps Dependencies, opts *scanOptions, noColor *
 
 	report, err := svc.Scan(cmd.Context(), target)
 	if err != nil {
-		return security.SanitizeError(err, token.Expose())
+		return sanitizeCLIError(err, deps.LookupEnv, token.Expose())
 	}
 
 	disableColor := (noColor != nil && *noColor) || deps.LookupEnv("NO_COLOR") != ""

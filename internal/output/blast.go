@@ -49,7 +49,8 @@ func renderBlastTable(w io.Writer, report *model.BlastReport, noColor bool) erro
 			return err
 		}
 		for _, m := range report.Matches {
-			if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", m.Repo, m.Ecosystem, m.Package, m.Version, m.Lockfile); err != nil {
+			if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+				sanitizeText(m.Repo), sanitizeText(m.Ecosystem), sanitizeText(m.Package), sanitizeText(m.Version), sanitizeText(m.Lockfile)); err != nil {
 				return err
 			}
 		}
@@ -81,10 +82,10 @@ func renderBlastTable(w io.Writer, report *model.BlastReport, noColor bool) erro
 			if _, err := fmt.Fprintf(tw, "#%d\t%s\t%s\t%s\t%d\t%s\n",
 				item.Priority,
 				sev,
-				item.SecretName,
-				formatRepos(item.AffectedRepos),
+				sanitizeText(item.SecretName),
+				sanitizeText(formatRepos(item.AffectedRepos)),
 				item.RecentRunCount,
-				item.Reason,
+				sanitizeText(item.Reason),
 			); err != nil {
 				return err
 			}
@@ -99,7 +100,8 @@ func renderBlastTable(w io.Writer, report *model.BlastReport, noColor bool) erro
 			return err
 		}
 		for _, warn := range report.Warnings {
-			if _, err := fmt.Fprintf(w, "- [%s] %s (%s): %s\n", warn.Code, warn.Target, warn.Scope, warn.Message); err != nil {
+			if _, err := fmt.Fprintf(w, "- [%s] %s (%s): %s\n",
+				sanitizeText(warn.Code), sanitizeText(warn.Target), sanitizeText(warn.Scope), sanitizeText(warn.Message)); err != nil {
 				return err
 			}
 		}

@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -11,9 +12,10 @@ import (
 	"github.com/JOsee321/Rotex/internal/lockfile"
 	"github.com/JOsee321/Rotex/internal/model"
 	"github.com/JOsee321/Rotex/internal/output"
-	"github.com/JOsee321/Rotex/internal/security"
 	"github.com/spf13/cobra"
 )
+
+const maxAdvisoryFileBytes = 10 << 20 // 10 MiB
 
 type blastOptions struct {
 	org             string
@@ -76,7 +78,7 @@ func runBlast(cmd *cobra.Command, deps Dependencies, opts *blastOptions, noColor
 		specs = append(specs, spec)
 	}
 	if strings.TrimSpace(opts.advisory) != "" {
-		rawAdv, readErr := os.ReadFile(opts.advisory)
+		rawAdv, readErr := readBoundedFile(opts.advisory, maxAdvisoryFileBytes)
 		if readErr != nil {
 			return fmt.Errorf("read advisory file %s: %w", opts.advisory, readErr)
 		}
@@ -105,7 +107,7 @@ func runBlast(cmd *cobra.Command, deps Dependencies, opts *blastOptions, noColor
 	if opts.withAWS {
 		insp, awsErr := deps.AWSInspectorFactory(cmd.Context())
 		if awsErr != nil {
-			return awsErr
+			return sanitizeCLIError(awsErr, deps.LookupEnv, token.Expose())
 		}
 		blastOpts = append(blastOpts, blast.WithAWSInspector(insp))
 	}
@@ -121,7 +123,7 @@ func runBlast(cmd *cobra.Command, deps Dependencies, opts *blastOptions, noColor
 		Since:    opts.since,
 	})
 	if err != nil {
-		return security.SanitizeError(err, token.Expose())
+		return sanitizeCLIError(err, deps.LookupEnv, token.Expose())
 	}
 
 	disableColor := (noColor != nil && *noColor) || deps.LookupEnv("NO_COLOR") != ""
@@ -129,4 +131,21 @@ func runBlast(cmd *cobra.Command, deps Dependencies, opts *blastOptions, noColor
 		Format:  format,
 		NoColor: disableColor,
 	})
+}
+
+func readBoundedFile(path string, limit int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("file size exceeds %d byte limit", limit)
+	}
+	return data, nil
 }

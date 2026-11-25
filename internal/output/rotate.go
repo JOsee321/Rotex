@@ -68,16 +68,16 @@ func renderPlanTable(w io.Writer, plan *rotate.ExecutionPlan) error {
 	if _, err := fmt.Fprintf(tw, "1. PREFLIGHT\t%s\tVerify AWS 2-key quota and GitHub public keys\n", plan.Target.IAMUser); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(tw, "2. MINT\t%s\tCreate dual AWS IAM access key in memory\n", plan.Target.IAMUser); err != nil {
+	if _, err := fmt.Fprintf(tw, "2. MINT\t%s\tCreate dual AWS IAM access key in memory\n", sanitizeText(plan.Target.IAMUser)); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(tw, "3. VERIFY\t%s\tVerify new key via sts:GetCallerIdentity\n", sanitizeText(plan.Target.IAMUser)); err != nil {
 		return err
 	}
 	for _, sc := range plan.StoreTargets {
-		if _, err := fmt.Fprintf(tw, "3. INJECT\t%s\tEncrypt with SealedBox and update %s\n", sc.Label(), strings.Join(plan.SecretNames, ", ")); err != nil {
+		if _, err := fmt.Fprintf(tw, "4. INJECT\t%s\tEncrypt with SealedBox and update %s\n", sanitizeText(sc.Label()), sanitizeText(strings.Join(plan.SecretNames, ", "))); err != nil {
 			return err
 		}
-	}
-	if _, err := fmt.Fprintf(tw, "4. VERIFY\t%s\tVerify new key via sts:GetCallerIdentity\n", plan.Target.IAMUser); err != nil {
-		return err
 	}
 	action := "Deactivate old key (24h grace window)"
 	if plan.ImmediateDelete {
@@ -135,7 +135,7 @@ func renderStateTable(w io.Writer, state *rotate.RunState) error {
 		if errMsg == "" {
 			errMsg = "-"
 		}
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", t.Target.Scope, t.Target.Label(), t.Status, errMsg); err != nil {
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", t.Target.Scope, sanitizeText(t.Target.Label()), t.Status, sanitizeText(errMsg)); err != nil {
 			return err
 		}
 	}
