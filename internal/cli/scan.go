@@ -2,20 +2,29 @@ package cli
 
 import (
 	"errors"
+	"strings"
 
+	"github.com/JOsee321/Rotex/internal/model"
+	"github.com/JOsee321/Rotex/internal/output"
+	"github.com/JOsee321/Rotex/internal/scanner"
+	"github.com/JOsee321/Rotex/internal/security"
 	"github.com/spf13/cobra"
 )
 
 type scanOptions struct {
-	org     string
-	repo    string
-	format  string
-	withAWS bool
+	org             string
+	repo            string
+	format          string
+	withAWS         bool
+	includeArchived bool
+	concurrency     int
+	apiURL          string
 }
 
-func newScanCommand() *cobra.Command {
+func newScanCommand(deps Dependencies, noColor *bool) *cobra.Command {
 	opts := &scanOptions{
-		format: "table",
+		format:      string(output.FormatTable),
+		concurrency: 5,
 	}
 
 	cmd := &cobra.Command{
@@ -26,7 +35,7 @@ func newScanCommand() *cobra.Command {
 			"This command is strictly read-only and never accesses raw secret values.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return errors.New("scan command is not implemented yet")
+			return runScan(cmd, deps, opts, noColor)
 		},
 	}
 
@@ -35,6 +44,60 @@ func newScanCommand() *cobra.Command {
 	flags.StringVar(&opts.repo, "repo", "", "Single GitHub repository to scan (owner/name)")
 	flags.StringVar(&opts.format, "format", opts.format, "Output format (table|json|markdown)")
 	flags.BoolVar(&opts.withAWS, "with-aws", false, "Correlate findings with read-only AWS IAM metadata")
+	flags.BoolVar(&opts.includeArchived, "include-archived", false, "Include archived repositories in the scan")
+	flags.IntVar(&opts.concurrency, "concurrency", opts.concurrency, "Maximum concurrent repository workers (1-16)")
+	flags.StringVar(&opts.apiURL, "api-url", "", "Override GitHub REST API base URL (or set GITHUB_API_URL)")
 
 	return cmd
+}
+
+func runScan(cmd *cobra.Command, deps Dependencies, opts *scanOptions, noColor *bool) error {
+	if opts.withAWS {
+		return errors.New("--with-aws correlation is not implemented yet")
+	}
+
+	format, err := output.ParseFormat(opts.format)
+	if err != nil {
+		return err
+	}
+
+	token := resolveGitHubToken(deps.LookupEnv)
+	if token.IsEmpty() {
+		return errors.New("GITHUB_TOKEN (or GH_TOKEN) environment variable is required")
+	}
+
+	apiURL := strings.TrimSpace(opts.apiURL)
+	if apiURL == "" {
+		apiURL = strings.TrimSpace(deps.LookupEnv("GITHUB_API_URL"))
+	}
+
+	ghClient := deps.GitHubClientFactory(token, apiURL)
+	svc := scanner.NewService(ghClient, scanner.WithConcurrency(opts.concurrency))
+
+	target := model.ScanTarget{
+		Org:             strings.TrimSpace(opts.org),
+		Repo:            strings.TrimSpace(opts.repo),
+		IncludeArchived: opts.includeArchived,
+	}
+
+	report, err := svc.Scan(cmd.Context(), target)
+	if err != nil {
+		return security.SanitizeError(err, token.Expose())
+	}
+
+	disableColor := (noColor != nil && *noColor) || deps.LookupEnv("NO_COLOR") != ""
+	return output.Render(cmd.OutOrStdout(), report, output.Options{
+		Format:  format,
+		NoColor: disableColor,
+	})
+}
+
+func resolveGitHubToken(lookup func(string) string) security.SensitiveString {
+	if tok := strings.TrimSpace(lookup("GITHUB_TOKEN")); tok != "" {
+		return security.NewSensitiveString(tok)
+	}
+	if tok := strings.TrimSpace(lookup("GH_TOKEN")); tok != "" {
+		return security.NewSensitiveString(tok)
+	}
+	return security.SensitiveString{}
 }

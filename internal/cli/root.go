@@ -1,11 +1,46 @@
 package cli
 
 import (
+	"os"
+
+	"github.com/JOsee321/Rotex/internal/github"
+	"github.com/JOsee321/Rotex/internal/security"
 	"github.com/spf13/cobra"
 )
 
-// NewRootCommand constructs the top-level rotex CLI command tree.
+// Dependencies supplies external clients and environment readers for CLI commands.
+type Dependencies struct {
+	GitHubClientFactory func(token security.SensitiveString, apiURL string) github.Client
+	LookupEnv           func(key string) string
+}
+
+func defaultDependencies() Dependencies {
+	return Dependencies{
+		GitHubClientFactory: func(token security.SensitiveString, apiURL string) github.Client {
+			var opts []github.Option
+			if apiURL != "" {
+				opts = append(opts, github.WithBaseURL(apiURL))
+			}
+			return github.NewRESTClient(token, opts...)
+		},
+		LookupEnv: os.Getenv,
+	}
+}
+
+// NewRootCommand constructs the top-level rotex CLI command tree with default dependencies.
 func NewRootCommand() *cobra.Command {
+	return NewRootCommandWithDeps(defaultDependencies())
+}
+
+// NewRootCommandWithDeps constructs the top-level rotex CLI command tree using custom dependencies.
+func NewRootCommandWithDeps(deps Dependencies) *cobra.Command {
+	if deps.LookupEnv == nil {
+		deps.LookupEnv = os.Getenv
+	}
+	if deps.GitHubClientFactory == nil {
+		deps.GitHubClientFactory = defaultDependencies().GitHubClientFactory
+	}
+
 	var noColor bool
 
 	cmd := &cobra.Command{
@@ -21,7 +56,7 @@ func NewRootCommand() *cobra.Command {
 
 	cmd.AddCommand(
 		newVersionCommand(),
-		newScanCommand(),
+		newScanCommand(deps, &noColor),
 	)
 
 	return cmd
