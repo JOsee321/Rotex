@@ -219,6 +219,40 @@ func TestRESTClientLockfilesAndWorkflowRuns(t *testing.T) {
 	}
 }
 
+func TestRESTClientDistinguishes403RateLimitFromPermissionDenied(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/acme/rate-limited/actions/secrets":
+			w.Header().Set("X-RateLimit-Remaining", "0")
+			w.Header().Set("X-RateLimit-Reset", "1795600000")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"message": "API rate limit exceeded"})
+		case "/repos/acme/forbidden/actions/secrets":
+			w.Header().Set("X-RateLimit-Remaining", "50")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{"message": "Resource not accessible by integration"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	client := newMockRESTClient("tok", handler)
+	ctx := context.Background()
+
+	_, rlErr := client.ListRepoSecrets(ctx, "acme", "rate-limited")
+	if !IsRateLimited(rlErr) {
+		t.Fatalf("expected IsRateLimited=true, got %v", rlErr)
+	}
+	if IsPermissionDenied(rlErr) {
+		t.Fatalf("rate-limited 403 must NOT be treated as permission denied")
+	}
+
+	_, permErr := client.ListRepoSecrets(ctx, "acme", "forbidden")
+	if !IsPermissionDenied(permErr) || IsRateLimited(permErr) {
+		t.Fatalf("expected IsPermissionDenied=true and IsRateLimited=false, got %v", permErr)
+	}
+}
+
 func mustTime(t *testing.T, raw string) time.Time {
 	t.Helper()
 	ts, err := time.Parse(time.RFC3339, raw)

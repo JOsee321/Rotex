@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/JOsee321/Rotex/internal/model"
@@ -63,24 +64,60 @@ type Client interface {
 
 // APIError captures an HTTP error response returned by the GitHub API.
 type APIError struct {
-	StatusCode     int
-	Message        string
-	Endpoint       string
-	RateLimitReset time.Time
+	StatusCode         int
+	Message            string
+	Endpoint           string
+	RateLimitRemaining *int
+	RateLimitReset     time.Time
+}
+
+// IsRateLimited reports whether this APIError was caused by GitHub rate limiting.
+func (e *APIError) IsRateLimited() bool {
+	if e == nil {
+		return false
+	}
+	if e.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	if e.StatusCode == http.StatusForbidden {
+		if e.RateLimitRemaining != nil && *e.RateLimitRemaining == 0 {
+			return true
+		}
+		lower := strings.ToLower(e.Message)
+		return strings.Contains(lower, "rate limit") || strings.Contains(lower, "secondary rate")
+	}
+	return false
 }
 
 // Error implements the error interface without including sensitive credentials.
 func (e *APIError) Error() string {
+	base := fmt.Sprintf("github API %s returned HTTP %d", e.Endpoint, e.StatusCode)
 	if e.Message != "" {
-		return fmt.Sprintf("github API %s returned HTTP %d: %s", e.Endpoint, e.StatusCode, e.Message)
+		base += ": " + e.Message
 	}
-	return fmt.Sprintf("github API %s returned HTTP %d", e.Endpoint, e.StatusCode)
+	if e.IsRateLimited() && !e.RateLimitReset.IsZero() {
+		base += fmt.Sprintf(" (rate limit resets at %s)", e.RateLimitReset.UTC().Format(time.RFC3339))
+	}
+	return base
 }
 
-// IsPermissionDenied reports whether err represents an HTTP 403 Forbidden error.
+// IsPermissionDenied reports whether err represents an HTTP 403 Forbidden error
+// (excluding rate-limit responses).
 func IsPermissionDenied(err error) bool {
 	var apiErr *APIError
-	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusForbidden
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusForbidden && !apiErr.IsRateLimited()
+}
+
+// IsRateLimited reports whether err represents a GitHub API rate-limit error.
+func IsRateLimited(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.IsRateLimited()
+}
+
+// IsUnauthorized reports whether err represents an HTTP 401 Unauthorized error.
+func IsUnauthorized(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnauthorized
 }
 
 // IsNotFound reports whether err represents an HTTP 404 Not Found error.

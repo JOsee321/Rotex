@@ -523,6 +523,13 @@ func parseAPIError(resp *http.Response, endpoint string, body []byte) error {
 	}
 	_ = json.Unmarshal(body, &payload)
 
+	var remaining *int
+	if rawRem := resp.Header.Get("X-RateLimit-Remaining"); rawRem != "" {
+		if val, err := strconv.Atoi(rawRem); err == nil {
+			remaining = &val
+		}
+	}
+
 	var resetAt time.Time
 	if raw := resp.Header.Get("X-RateLimit-Reset"); raw != "" {
 		if unixSec, err := strconv.ParseInt(raw, 10, 64); err == nil {
@@ -531,10 +538,11 @@ func parseAPIError(resp *http.Response, endpoint string, body []byte) error {
 	}
 
 	return &APIError{
-		StatusCode:     resp.StatusCode,
-		Message:        payload.Message,
-		Endpoint:       endpoint,
-		RateLimitReset: resetAt,
+		StatusCode:         resp.StatusCode,
+		Message:            payload.Message,
+		Endpoint:           endpoint,
+		RateLimitRemaining: remaining,
+		RateLimitReset:     resetAt,
 	}
 }
 
