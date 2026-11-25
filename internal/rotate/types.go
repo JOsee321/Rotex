@@ -103,14 +103,14 @@ type TargetInjectionStatus struct {
 
 // ExecutionPlan describes the deterministic dry-run plan before any mutations occur.
 type ExecutionPlan struct {
-	Provider        string          `json:"provider"`
-	Target          KeyTarget       `json:"target"`
-	Preflight       *PreflightInfo  `json:"preflight"`
-	SecretNames     []string        `json:"secret_names"`
-	StoreTargets    []StoreScope    `json:"store_targets"`
-	ImmediateDelete bool            `json:"immediate_delete"`
-	Warnings        []string        `json:"warnings,omitempty"`
-	GeneratedAt     time.Time       `json:"generated_at"`
+	Provider        string         `json:"provider"`
+	Target          KeyTarget      `json:"target"`
+	Preflight       *PreflightInfo `json:"preflight"`
+	SecretNames     []string       `json:"secret_names"`
+	StoreTargets    []StoreScope   `json:"store_targets"`
+	ImmediateDelete bool           `json:"immediate_delete"`
+	Warnings        []string       `json:"warnings,omitempty"`
+	GeneratedAt     time.Time      `json:"generated_at"`
 }
 
 // RunState is persisted to .rotex/state/<run-id>.json using metadata and IDs only.
