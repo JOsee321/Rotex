@@ -19,6 +19,9 @@ const (
 	EcosystemNPM  Ecosystem = "npm"
 	EcosystemGo   Ecosystem = "go"
 	EcosystemPyPI Ecosystem = "pypi"
+
+	maxLockfileBytes    = 32 << 20 // 32 MiB
+	maxScannerLineBytes = 4 << 20  // 4 MiB
 )
 
 // Dependency represents a single resolved package entry parsed from a lockfile.
@@ -53,6 +56,9 @@ func IsLockfile(p string) bool {
 
 // Parse extracts resolved dependencies from a supported lockfile.
 func Parse(path string, content []byte) ([]Dependency, error) {
+	if len(content) > maxLockfileBytes {
+		return nil, fmt.Errorf("parse %s: lockfile size %d bytes exceeds %d byte limit", path, len(content), maxLockfileBytes)
+	}
 	base := strings.ToLower(pathpkg.Base(strings.ReplaceAll(path, "\\", "/")))
 	switch base {
 	case "package-lock.json":
@@ -203,16 +209,18 @@ func parsePackageLock(path string, content []byte) ([]Dependency, error) {
 		add(name, pkg.Version)
 	}
 
-	var walkDeps func(m map[string]packageLockDep)
-	walkDeps = func(m map[string]packageLockDep) {
-		for name, info := range m {
+	// Iterative traversal prevents stack overflow on deeply nested package-lock.json trees.
+	queue := []map[string]packageLockDep{doc.Dependencies}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for name, info := range cur {
 			add(name, info.Version)
 			if len(info.Dependencies) > 0 {
-				walkDeps(info.Dependencies)
+				queue = append(queue, info.Dependencies)
 			}
 		}
 	}
-	walkDeps(doc.Dependencies)
 
 	return out, nil
 }
@@ -276,10 +284,16 @@ func parsePnpmPackageKey(raw string) (string, string) {
 	return "", ""
 }
 
+func newLockScanner(content []byte) *bufio.Scanner {
+	s := bufio.NewScanner(bytes.NewReader(content))
+	s.Buffer(make([]byte, 0, 64*1024), maxScannerLineBytes)
+	return s
+}
+
 func parseYarnLock(path string, content []byte) ([]Dependency, error) {
 	var out []Dependency
 	seen := make(map[string]struct{})
-	scanner := bufio.NewScanner(bytes.NewReader(content))
+	scanner := newLockScanner(content)
 
 	var currentNames []string
 	for scanner.Scan() {
@@ -341,7 +355,7 @@ func parseYarnHeaderNames(header string) []string {
 func parseGoSum(path string, content []byte) ([]Dependency, error) {
 	var out []Dependency
 	seen := make(map[string]struct{})
-	scanner := bufio.NewScanner(bytes.NewReader(content))
+	scanner := newLockScanner(content)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) < 2 {
@@ -365,7 +379,7 @@ func parseGoSum(path string, content []byte) ([]Dependency, error) {
 func parseRequirementsTxt(path string, content []byte) ([]Dependency, error) {
 	var out []Dependency
 	seen := make(map[string]struct{})
-	scanner := bufio.NewScanner(bytes.NewReader(content))
+	scanner := newLockScanner(content)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "-") {
@@ -414,7 +428,7 @@ func splitRequirement(line string) (string, string) {
 func parsePoetryLock(path string, content []byte) ([]Dependency, error) {
 	var out []Dependency
 	seen := make(map[string]struct{})
-	scanner := bufio.NewScanner(bytes.NewReader(content))
+	scanner := newLockScanner(content)
 	var inPkg bool
 	var curName, curVer string
 

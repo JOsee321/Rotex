@@ -12,11 +12,19 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	maxWorkflowBytes = 2 << 20 // 2 MiB
+	maxYAMLWalkDepth = 128
+	maxAliasHops     = 16
+)
+
 var (
-	exprBlockRe  = regexp.MustCompile(`(?s)\$\{\{(.*?)\}\}`)
-	secretRefRe  = regexp.MustCompile(`(?i)\bsecrets\.([A-Za-z_][A-Za-z0-9_]*)\b`)
-	commitSHA1Re = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
-	commitSHA2Re = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+	exprBlockRe    = regexp.MustCompile(`(?s)\$\{\{(.*?)\}\}`)
+	secretRefRe    = regexp.MustCompile(`(?i)\bsecrets\.([A-Za-z_][A-Za-z0-9_]*)\b`)
+	secretBrkRe    = regexp.MustCompile(`(?i)\bsecrets\[['"]([A-Za-z_][A-Za-z0-9_]*)['"]\]`)
+	commitSHA1Re   = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
+	commitSHA2Re   = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+	dockerDigestRe = regexp.MustCompile(`@sha256:[0-9a-fA-F]{64}$`)
 )
 
 // SecretUsage represents one secret reference found inside a workflow file.
@@ -61,6 +69,9 @@ func IsWorkflowFile(p string) bool {
 // usage from a GitHub Actions workflow YAML document.
 func Parse(path string, content []byte) (*ParsedWorkflow, error) {
 	result := &ParsedWorkflow{Path: path}
+	if len(content) > maxWorkflowBytes {
+		return nil, fmt.Errorf("parse workflow %s: workflow size %d bytes exceeds %d byte limit", path, len(content), maxWorkflowBytes)
+	}
 	if len(bytes.TrimSpace(content)) == 0 {
 		return result, nil
 	}
@@ -73,8 +84,8 @@ func Parse(path string, content []byte) (*ParsedWorkflow, error) {
 		return result, nil
 	}
 
-	root := doc.Content[0]
-	if root.Kind != yaml.MappingNode {
+	root := derefAlias(doc.Content[0])
+	if root == nil || root.Kind != yaml.MappingNode {
 		return nil, fmt.Errorf("parse workflow %s: expected YAML mapping at root", path)
 	}
 
@@ -98,8 +109,8 @@ func Parse(path string, content []byte) (*ParsedWorkflow, error) {
 	if jobsNode := mappingValue(root, "jobs"); jobsNode != nil && jobsNode.Kind == yaml.MappingNode {
 		for i := 0; i+1 < len(jobsNode.Content); i += 2 {
 			jobID := jobsNode.Content[i].Value
-			jobNode := jobsNode.Content[i+1]
-			if jobNode.Kind != yaml.MappingNode {
+			jobNode := derefAlias(jobsNode.Content[i+1])
+			if jobNode == nil || jobNode.Kind != yaml.MappingNode {
 				continue
 			}
 
@@ -152,7 +163,13 @@ func parseJob(jobID string, jobNode *yaml.Node, workflowFlags []model.RiskFlag) 
 	}
 	for _, jl := range jobLocations {
 		if node := mappingValue(jobNode, jl.key); node != nil {
-			for _, name := range extractSecretsFromNode(node) {
+			var names []string
+			if jl.key == "if" {
+				names = extractSecretsFromConditionNode(node)
+			} else {
+				names = extractSecretsFromNode(node)
+			}
+			for _, name := range names {
 				jobRefs = append(jobRefs, SecretUsage{
 					SecretName: name,
 					JobID:      jobID,
@@ -177,8 +194,9 @@ func parseJob(jobID string, jobNode *yaml.Node, workflowFlags []model.RiskFlag) 
 	}
 
 	if stepsNode := mappingValue(jobNode, "steps"); stepsNode != nil && stepsNode.Kind == yaml.SequenceNode {
-		for idx, stepNode := range stepsNode.Content {
-			if stepNode.Kind != yaml.MappingNode {
+		for idx, rawStepNode := range stepsNode.Content {
+			stepNode := derefAlias(rawStepNode)
+			if stepNode == nil || stepNode.Kind != yaml.MappingNode {
 				continue
 			}
 			stepName := mappingScalar(stepNode, "name")
@@ -200,7 +218,13 @@ func parseJob(jobID string, jobNode *yaml.Node, workflowFlags []model.RiskFlag) 
 			}
 			for _, sl := range stepLocations {
 				if node := mappingValue(stepNode, sl.key); node != nil {
-					for _, name := range extractSecretsFromNode(node) {
+					var names []string
+					if sl.key == "if" {
+						names = extractSecretsFromConditionNode(node)
+					} else {
+						names = extractSecretsFromNode(node)
+					}
+					for _, name := range names {
 						jobRefs = append(jobRefs, SecretUsage{
 							SecretName: name,
 							JobID:      jobID,
@@ -290,7 +314,7 @@ func isUnpinnedActionRef(uses string) bool {
 		return false
 	}
 	if strings.HasPrefix(uses, "docker://") {
-		return !strings.Contains(uses, "@sha256:")
+		return !dockerDigestRe.MatchString(uses)
 	}
 	at := strings.LastIndex(uses, "@")
 	if at <= 0 || at == len(uses)-1 {
@@ -301,37 +325,54 @@ func isUnpinnedActionRef(uses string) bool {
 }
 
 func extractSecretsFromNode(node *yaml.Node) []string {
+	return walkSecrets(node, ExtractSecretNames)
+}
+
+func extractSecretsFromConditionNode(node *yaml.Node) []string {
+	return walkSecrets(node, extractSecretNamesFromExpression)
+}
+
+func walkSecrets(node *yaml.Node, extractor func(string) []string) []string {
 	if node == nil {
 		return nil
 	}
 	var found []string
-	var walk func(n *yaml.Node)
-	walk = func(n *yaml.Node) {
+	visited := make(map[*yaml.Node]struct{})
+	var walk func(n *yaml.Node, depth int)
+	walk = func(n *yaml.Node, depth int) {
+		if n == nil || depth > maxYAMLWalkDepth {
+			return
+		}
+		if _, seen := visited[n]; seen {
+			return
+		}
+		visited[n] = struct{}{}
+
 		switch n.Kind {
 		case yaml.ScalarNode:
-			for _, name := range ExtractSecretNames(n.Value) {
+			for _, name := range extractor(n.Value) {
 				found = mergeUniqueStrings(found, []string{name})
 			}
 		case yaml.SequenceNode:
 			for _, child := range n.Content {
-				walk(child)
+				walk(child, depth+1)
 			}
 		case yaml.MappingNode:
 			for i := 0; i+1 < len(n.Content); i += 2 {
-				walk(n.Content[i+1])
+				walk(n.Content[i+1], depth+1)
 			}
 		case yaml.AliasNode:
 			if n.Alias != nil {
-				walk(n.Alias)
+				walk(n.Alias, depth+1)
 			}
 		}
 	}
-	walk(node)
+	walk(node, 0)
 	return found
 }
 
 // ExtractSecretNames returns normalized uppercase secret names referenced via
-// `${{ secrets.NAME }}` expressions in text, excluding the built-in GITHUB_TOKEN.
+// `${{ secrets.NAME }}` or `${{ secrets['NAME'] }}` expressions in text, excluding GITHUB_TOKEN.
 func ExtractSecretNames(text string) []string {
 	var names []string
 	blocks := exprBlockRe.FindAllStringSubmatch(text, -1)
@@ -339,8 +380,17 @@ func ExtractSecretNames(text string) []string {
 		if len(block) < 2 {
 			continue
 		}
-		matches := secretRefRe.FindAllStringSubmatch(block[1], -1)
-		for _, m := range matches {
+		names = mergeUniqueStrings(names, extractSecretNamesFromExpression(block[1]))
+	}
+	return names
+}
+
+// extractSecretNamesFromExpression matches secrets references directly inside an expression
+// (used for `if:` conditions, which GitHub Actions evaluates even without `${{ ... }}`).
+func extractSecretNamesFromExpression(expr string) []string {
+	var names []string
+	for _, re := range []*regexp.Regexp{secretRefRe, secretBrkRe} {
+		for _, m := range re.FindAllStringSubmatch(expr, -1) {
 			if len(m) < 2 {
 				continue
 			}
@@ -355,13 +405,24 @@ func ExtractSecretNames(text string) []string {
 	return names
 }
 
+func derefAlias(n *yaml.Node) *yaml.Node {
+	for hop := 0; n != nil && n.Kind == yaml.AliasNode && hop < maxAliasHops; hop++ {
+		n = n.Alias
+	}
+	if n != nil && n.Kind == yaml.AliasNode {
+		return nil
+	}
+	return n
+}
+
 func mappingValue(m *yaml.Node, key string) *yaml.Node {
+	m = derefAlias(m)
 	if m == nil || m.Kind != yaml.MappingNode {
 		return nil
 	}
 	for i := 0; i+1 < len(m.Content); i += 2 {
 		if m.Content[i].Value == key {
-			return m.Content[i+1]
+			return derefAlias(m.Content[i+1])
 		}
 	}
 	return nil

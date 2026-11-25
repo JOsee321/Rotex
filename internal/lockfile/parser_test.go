@@ -1,6 +1,10 @@
 package lockfile
 
-import "testing"
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
 
 func TestIsLockfile(t *testing.T) {
 	for _, yes := range []string{
@@ -106,5 +110,19 @@ func TestParseAdvisoryJSON(t *testing.T) {
 	specs, err := ParseAdvisoryJSON(osv)
 	if err != nil || len(specs) != 2 {
 		t.Fatalf("ParseAdvisoryJSON OSV failed: %v, specs=%+v", err, specs)
+	}
+}
+
+func TestLockfileSizeCapAndLongLines(t *testing.T) {
+	// Long yarn.lock header (>64 KiB) must not fail with bufio.ErrTooLong.
+	longConstraint := strings.Repeat(`"evil-pkg@^1.0.0", `, 4500) + `"evil-pkg@1.2.3":` + "\n  version \"1.2.3\"\n"
+	deps, err := Parse("yarn.lock", []byte(longConstraint))
+	if err != nil || len(deps) != 1 {
+		t.Fatalf("expected long yarn.lock line to parse cleanly, got len=%d err=%v", len(deps), err)
+	}
+
+	oversized := bytes.Repeat([]byte("{}"), (maxLockfileBytes/2)+1)
+	if _, err := Parse("package-lock.json", oversized); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected oversized lockfile to be rejected, got %v", err)
 	}
 }

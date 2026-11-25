@@ -2,7 +2,9 @@ package workflow
 
 import (
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/JOsee321/Rotex/internal/model"
 )
@@ -178,5 +180,55 @@ func TestParseWorkflowErrorsAndEmpty(t *testing.T) {
 
 	if _, err := Parse(".github/workflows/bad.yml", []byte(":::invalid: [")); err == nil {
 		t.Fatalf("expected error on malformed YAML")
+	}
+}
+
+func TestParseWorkflowAliasBombDoSAndConditionEdgeCases(t *testing.T) {
+	// YAML billion-laughs alias expansion must complete instantly without OOM/CPU hang.
+	bomb := `
+on: push
+env:
+  a: &a ["${{ secrets.S1 }}", "${{ secrets.S2 }}"]
+  b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]
+  c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]
+  d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c, *c]
+  e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d, *d]
+  f: &f [*e, *e, *e, *e, *e, *e, *e, *e, *e, *e]
+  g: &g [*f, *f, *f, *f, *f, *f, *f, *f, *f, *f]
+  h: &h [*g, *g, *g, *g, *g, *g, *g, *g, *g, *g]
+jobs:
+  build:
+    if: secrets.COND_SECRET != ''
+    runs-on: ubuntu-latest
+    steps:
+      - if: secrets['BRACKET_SECRET'] == 'yes'
+        uses: docker://alpine:latest@sha256:not-a-real-hex-digest
+      - run: echo "${{ secrets['STEP_BRACKET'] }}"
+`
+	start := time.Now()
+	parsed, err := Parse(".github/workflows/bomb.yml", []byte(bomb))
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("YAML alias expansion took too long (%v)", time.Since(start))
+	}
+
+	got := map[string]SecretUsage{}
+	for _, ref := range parsed.References {
+		got[ref.SecretName] = ref
+	}
+	for _, want := range []string{"S1", "S2", "COND_SECRET", "BRACKET_SECRET", "STEP_BRACKET"} {
+		if _, ok := got[want]; !ok {
+			t.Fatalf("missing expected secret %s in %+v", want, got)
+		}
+	}
+	if !slices.Contains(got["BRACKET_SECRET"].RiskFlags, model.RiskUnpinnedAction) {
+		t.Fatalf("expected invalid docker digest to trigger unpinned_action")
+	}
+
+	oversized := make([]byte, maxWorkflowBytes+1)
+	if _, err := Parse(".github/workflows/huge.yml", oversized); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected oversized workflow YAML to be rejected, got %v", err)
 	}
 }
