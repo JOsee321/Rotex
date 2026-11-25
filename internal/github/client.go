@@ -31,6 +31,23 @@ type WorkflowFile struct {
 	Content []byte
 }
 
+// RepoFile holds the repository-relative path and raw content of a file.
+type RepoFile struct {
+	Path    string
+	Content []byte
+}
+
+// WorkflowRun represents read-only execution metadata for a GitHub Actions workflow run.
+type WorkflowRun struct {
+	ID         int64
+	Path       string
+	Name       string
+	Event      string
+	Status     string
+	Conclusion string
+	CreatedAt  time.Time
+}
+
 // Client defines read-only GitHub API operations required for Phase 1 scanning.
 type Client interface {
 	ListOrgRepos(ctx context.Context, org string) ([]Repository, error)
@@ -40,6 +57,8 @@ type Client interface {
 	ListEnvironments(ctx context.Context, owner, repo string) ([]Environment, error)
 	ListEnvironmentSecrets(ctx context.Context, owner, repo, env string) ([]model.SecretMetadata, error)
 	ListWorkflowFiles(ctx context.Context, owner, repo, ref string) ([]WorkflowFile, error)
+	ListRepoLockfiles(ctx context.Context, owner, repo, ref string) ([]RepoFile, error)
+	ListWorkflowRuns(ctx context.Context, owner, repo string, since time.Time) ([]WorkflowRun, error)
 }
 
 // APIError captures an HTTP error response returned by the GitHub API.

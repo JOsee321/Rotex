@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JOsee321/Rotex/internal/lockfile"
 	"github.com/JOsee321/Rotex/internal/model"
 	"github.com/JOsee321/Rotex/internal/security"
 	"github.com/JOsee321/Rotex/internal/workflow"
@@ -326,6 +327,118 @@ func (c *RESTClient) ListWorkflowFiles(ctx context.Context, owner, repo, ref str
 		})
 	}
 	return files, nil
+}
+
+// ListRepoLockfiles discovers and fetches supported dependency lockfiles in owner/repo.
+func (c *RESTClient) ListRepoLockfiles(ctx context.Context, owner, repo, ref string) ([]RepoFile, error) {
+	if strings.TrimSpace(ref) == "" {
+		ref = "HEAD"
+	}
+	treeEndpoint := fmt.Sprintf("/repos/%s/%s/git/trees/%s?recursive=1",
+		url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(ref))
+
+	var lockPaths []string
+	body, _, err := c.get(ctx, treeEndpoint, "application/vnd.github+json")
+	if err == nil {
+		var treeResp struct {
+			Tree []struct {
+				Path string `json:"path"`
+				Type string `json:"type"`
+			} `json:"tree"`
+		}
+		if json.Unmarshal(body, &treeResp) == nil {
+			for _, entry := range treeResp.Tree {
+				if entry.Type == "blob" && lockfile.IsLockfile(entry.Path) {
+					lockPaths = append(lockPaths, entry.Path)
+				}
+			}
+		}
+	} else if !IsNotFound(err) && !IsPermissionDenied(err) {
+		return nil, err
+	} else {
+		// Fallback to root directory listing when git tree is unavailable.
+		rootEndpoint := fmt.Sprintf("/repos/%s/%s/contents", url.PathEscape(owner), url.PathEscape(repo))
+		if ref != "HEAD" {
+			rootEndpoint += "?ref=" + url.QueryEscape(ref)
+		}
+		rootBody, _, rootErr := c.get(ctx, rootEndpoint, "application/vnd.github+json")
+		if rootErr != nil {
+			if IsNotFound(rootErr) {
+				return nil, nil
+			}
+			return nil, rootErr
+		}
+		var entries []apiContentItem
+		if json.Unmarshal(rootBody, &entries) == nil {
+			for _, entry := range entries {
+				if entry.Type == "file" && lockfile.IsLockfile(entry.Path) {
+					lockPaths = append(lockPaths, entry.Path)
+				}
+			}
+		}
+	}
+
+	var files []RepoFile
+	for _, p := range lockPaths {
+		raw, fetchErr := c.fetchFileContent(ctx, owner, repo, p, ref)
+		if fetchErr != nil {
+			if IsNotFound(fetchErr) {
+				continue
+			}
+			return nil, fetchErr
+		}
+		files = append(files, RepoFile{Path: p, Content: raw})
+	}
+	return files, nil
+}
+
+// ListWorkflowRuns lists workflow runs in owner/repo created at or after since.
+func (c *RESTClient) ListWorkflowRuns(ctx context.Context, owner, repo string, since time.Time) ([]WorkflowRun, error) {
+	endpoint := fmt.Sprintf("/repos/%s/%s/actions/runs?per_page=100", url.PathEscape(owner), url.PathEscape(repo))
+	if !since.IsZero() {
+		endpoint += "&created=" + url.QueryEscape(">="+since.UTC().Format(time.RFC3339))
+	}
+
+	var runs []WorkflowRun
+	for endpoint != "" {
+		body, next, err := c.get(ctx, endpoint, "application/vnd.github+json")
+		if err != nil {
+			if IsNotFound(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		var resp struct {
+			WorkflowRuns []struct {
+				ID         int64     `json:"id"`
+				Path       string    `json:"path"`
+				Name       string    `json:"name"`
+				Event      string    `json:"event"`
+				Status     string    `json:"status"`
+				Conclusion string    `json:"conclusion"`
+				CreatedAt  time.Time `json:"created_at"`
+			} `json:"workflow_runs"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, fmt.Errorf("decode workflow runs: %w", err)
+		}
+		for _, r := range resp.WorkflowRuns {
+			if !since.IsZero() && r.CreatedAt.Before(since) {
+				continue
+			}
+			runs = append(runs, WorkflowRun{
+				ID:         r.ID,
+				Path:       r.Path,
+				Name:       r.Name,
+				Event:      r.Event,
+				Status:     r.Status,
+				Conclusion: r.Conclusion,
+				CreatedAt:  r.CreatedAt,
+			})
+		}
+		endpoint = next
+	}
+	return runs, nil
 }
 
 func (c *RESTClient) fetchFileContent(ctx context.Context, owner, repo, filePath, ref string) ([]byte, error) {

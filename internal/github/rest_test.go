@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/JOsee321/Rotex/internal/model"
 	"github.com/JOsee321/Rotex/internal/security"
@@ -171,4 +172,58 @@ func TestRESTClientSecretsEnvironmentsAndWorkflows(t *testing.T) {
 	if err != nil || len(emptyFiles) != 0 {
 		t.Fatalf("expected empty workflow files on 404, got %+v, err=%v", emptyFiles, err)
 	}
+}
+
+func TestRESTClientLockfilesAndWorkflowRuns(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/acme/api/git/trees/main":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tree": []map[string]any{
+					{"path": "apps/web/package-lock.json", "type": "blob"},
+					{"path": "README.md", "type": "blob"},
+				},
+			})
+		case "/repos/acme/api/contents/apps/web/package-lock.json":
+			_, _ = w.Write([]byte(`{"lockfileVersion":3,"packages":{"node_modules/evil":{"version":"1.0.0"}}}`))
+		case "/repos/acme/api/actions/runs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"workflow_runs": []map[string]any{
+					{
+						"id":         101,
+						"path":       ".github/workflows/ci.yml",
+						"name":       "CI",
+						"event":      "push",
+						"status":     "completed",
+						"conclusion": "success",
+						"created_at": "2026-11-25T10:00:00Z",
+					},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	client := newMockRESTClient("tok", handler)
+	ctx := context.Background()
+
+	lockfiles, err := client.ListRepoLockfiles(ctx, "acme", "api", "main")
+	if err != nil || len(lockfiles) != 1 || lockfiles[0].Path != "apps/web/package-lock.json" {
+		t.Fatalf("unexpected lockfiles: %+v, err=%v", lockfiles, err)
+	}
+
+	runs, err := client.ListWorkflowRuns(ctx, "acme", "api", mustTime(t, "2026-11-24T00:00:00Z"))
+	if err != nil || len(runs) != 1 || runs[0].ID != 101 {
+		t.Fatalf("unexpected runs: %+v, err=%v", runs, err)
+	}
+}
+
+func mustTime(t *testing.T, raw string) time.Time {
+	t.Helper()
+	ts, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		t.Fatalf("time.Parse failed: %v", err)
+	}
+	return ts
 }

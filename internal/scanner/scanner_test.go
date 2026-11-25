@@ -104,6 +104,14 @@ func (m *mockGitHubClient) ListWorkflowFiles(_ context.Context, owner, repo, _ s
 	return m.workflows[owner+"/"+repo], nil
 }
 
+func (m *mockGitHubClient) ListRepoLockfiles(_ context.Context, _, _, _ string) ([]github.RepoFile, error) {
+	return nil, nil
+}
+
+func (m *mockGitHubClient) ListWorkflowRuns(_ context.Context, _, _ string, _ time.Time) ([]github.WorkflowRun, error) {
+	return nil, nil
+}
+
 func TestScanOrgGracefulDegradationAndInherit(t *testing.T) {
 	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 	client := &mockGitHubClient{
