@@ -66,6 +66,7 @@ func NewRootCommandWithDeps(deps Dependencies) *cobra.Command {
 	cmd.AddCommand(
 		newVersionCommand(),
 		newScanCommand(deps, &noColor),
+		newBlastCommand(deps, &noColor),
 	)
 
 	return cmd

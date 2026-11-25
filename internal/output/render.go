@@ -58,7 +58,7 @@ func Render(w io.Writer, report *model.ScanReport, opts Options) error {
 	}
 }
 
-func renderJSON(w io.Writer, report *model.ScanReport) error {
+func renderJSON(w io.Writer, report any) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(report)

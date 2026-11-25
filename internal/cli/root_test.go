@@ -58,6 +58,14 @@ func (s *stubGitHubClient) ListWorkflowFiles(_ context.Context, _, _, _ string) 
 	return s.workflows, nil
 }
 
+func (s *stubGitHubClient) ListRepoLockfiles(_ context.Context, _, _, _ string) ([]github.RepoFile, error) {
+	return nil, nil
+}
+
+func (s *stubGitHubClient) ListWorkflowRuns(_ context.Context, _, _ string, _ time.Time) ([]github.WorkflowRun, error) {
+	return nil, nil
+}
+
 func TestVersionCommand(t *testing.T) {
 	var out bytes.Buffer
 	cmd := NewRootCommand()
@@ -199,5 +207,53 @@ func TestScanCommandWithAWSFlag(t *testing.T) {
 	}
 	if len(report.AWSKeys) != 1 || report.Exposures[0].AWS == nil {
 		t.Fatalf("expected AWS key correlation in report: %+v", report)
+	}
+}
+
+func TestBlastCommandExecution(t *testing.T) {
+	stub := &stubGitHubClient{
+		repo: github.Repository{Owner: "octocat", Name: "hello", FullName: "octocat/hello", DefaultBranch: "main"},
+		repoSecrets: []model.SecretMetadata{
+			{Name: "NPM_TOKEN", Scope: model.ScopeRepo, Owner: "octocat", Repo: "octocat/hello", UpdatedAt: time.Now().UTC()},
+		},
+		workflows: []github.WorkflowFile{
+			{
+				Path:    ".github/workflows/ci.yml",
+				Content: []byte("on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n        env:\n          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n"),
+			},
+		},
+	}
+
+	deps := Dependencies{
+		LookupEnv: func(key string) string {
+			if key == "GITHUB_TOKEN" {
+				return "ghp_mock"
+			}
+			return ""
+		},
+		GitHubClientFactory: func(_ security.SensitiveString, _ string) github.Client { return stub },
+	}
+
+	// Missing --pkg should error.
+	errCmd := NewRootCommandWithDeps(deps)
+	errCmd.SetArgs([]string{"blast", "--repo", "octocat/hello"})
+	if err := errCmd.Execute(); err == nil {
+		t.Fatalf("expected error when --pkg and --advisory are omitted")
+	}
+
+	var out bytes.Buffer
+	cmd := NewRootCommandWithDeps(deps)
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"blast", "--repo", "octocat/hello", "--pkg", "evil-pkg@1.0.0", "--format", "json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("blast command failed: %v", err)
+	}
+	var report model.BlastReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatalf("invalid blast JSON: %v", err)
+	}
+	if len(report.Packages) != 1 || report.Packages[0] != "evil-pkg@1.0.0" {
+		t.Fatalf("unexpected blast report: %+v", report)
 	}
 }

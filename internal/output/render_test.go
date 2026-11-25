@@ -93,3 +93,54 @@ func TestRenderFormats(t *testing.T) {
 		t.Fatalf("unexpected JSON summary: %+v", decoded.Summary)
 	}
 }
+
+func TestRenderBlastFormats(t *testing.T) {
+	report := &model.BlastReport{
+		Target:      model.ScanTarget{Org: "acme"},
+		GeneratedAt: time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC),
+		SinceHours:  72,
+		Packages:    []string{"evil@1.2.3"},
+		Matches: []model.CompromisedMatch{
+			{Repo: "acme/web", Ecosystem: "npm", Package: "evil", Version: "1.2.3", Lockfile: "package-lock.json"},
+		},
+		RotationQueue: []model.ExposedSecretPriority{
+			{
+				Priority:       1,
+				Severity:       "CRITICAL",
+				Score:          95,
+				SecretName:     "AWS_ACCESS_KEY_ID",
+				AffectedRepos:  []string{"acme/web"},
+				RecentRunCount: 2,
+				Reason:         "used in 1 affected repo(s)",
+			},
+		},
+	}
+
+	var tableBuf bytes.Buffer
+	if err := RenderBlast(&tableBuf, report, Options{Format: FormatTable, NoColor: true}); err != nil {
+		t.Fatalf("RenderBlast table failed: %v", err)
+	}
+	if !strings.Contains(tableBuf.String(), "AWS_ACCESS_KEY_ID") || !strings.Contains(tableBuf.String(), "CRITICAL") {
+		t.Fatalf("unexpected blast table output:\n%s", tableBuf.String())
+	}
+
+	var mdBuf bytes.Buffer
+	if err := RenderBlast(&mdBuf, report, Options{Format: FormatMarkdown}); err != nil {
+		t.Fatalf("RenderBlast markdown failed: %v", err)
+	}
+	if !strings.Contains(mdBuf.String(), "| #1 | **CRITICAL** | `AWS_ACCESS_KEY_ID` |") {
+		t.Fatalf("unexpected blast markdown output:\n%s", mdBuf.String())
+	}
+
+	var jsonBuf bytes.Buffer
+	if err := RenderBlast(&jsonBuf, report, Options{Format: FormatJSON}); err != nil {
+		t.Fatalf("RenderBlast json failed: %v", err)
+	}
+	var decoded model.BlastReport
+	if err := json.Unmarshal(jsonBuf.Bytes(), &decoded); err != nil {
+		t.Fatalf("invalid blast JSON: %v", err)
+	}
+	if len(decoded.RotationQueue) != 1 {
+		t.Fatalf("unexpected decoded blast report: %+v", decoded)
+	}
+}
