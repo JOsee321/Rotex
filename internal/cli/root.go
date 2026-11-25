@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"os"
+	"time"
 
 	"github.com/JOsee321/Rotex/internal/aws"
 	"github.com/JOsee321/Rotex/internal/github"
+	"github.com/JOsee321/Rotex/internal/rotate"
 	"github.com/JOsee321/Rotex/internal/security"
 	"github.com/spf13/cobra"
 )
@@ -14,6 +16,8 @@ import (
 type Dependencies struct {
 	GitHubClientFactory func(token security.SensitiveString, apiURL string) github.Client
 	AWSInspectorFactory func(ctx context.Context) (aws.Inspector, error)
+	AWSRotatorFactory   func(ctx context.Context, iamEP, stsEP string, verifyTimeout, verifyBackoff time.Duration) (rotate.CredentialProvider, error)
+	SecretStoreFactory  func(token security.SensitiveString, apiURL string) rotate.SecretStore
 	LookupEnv           func(key string) string
 }
 
@@ -29,7 +33,9 @@ func defaultDependencies() Dependencies {
 		AWSInspectorFactory: func(ctx context.Context) (aws.Inspector, error) {
 			return aws.NewDefaultInspector(ctx)
 		},
-		LookupEnv: os.Getenv,
+		AWSRotatorFactory:  defaultRotatorFactory,
+		SecretStoreFactory: defaultSecretStoreFactory,
+		LookupEnv:          os.Getenv,
 	}
 }
 
@@ -49,6 +55,12 @@ func NewRootCommandWithDeps(deps Dependencies) *cobra.Command {
 	if deps.AWSInspectorFactory == nil {
 		deps.AWSInspectorFactory = defaultDependencies().AWSInspectorFactory
 	}
+	if deps.AWSRotatorFactory == nil {
+		deps.AWSRotatorFactory = defaultDependencies().AWSRotatorFactory
+	}
+	if deps.SecretStoreFactory == nil {
+		deps.SecretStoreFactory = defaultDependencies().SecretStoreFactory
+	}
 
 	var noColor bool
 
@@ -67,6 +79,9 @@ func NewRootCommandWithDeps(deps Dependencies) *cobra.Command {
 		newVersionCommand(),
 		newScanCommand(deps, &noColor),
 		newBlastCommand(deps, &noColor),
+		newRotateCommand(deps, &noColor),
+		newRollbackCommand(deps, &noColor),
+		newCleanupCommand(deps, &noColor),
 	)
 
 	return cmd

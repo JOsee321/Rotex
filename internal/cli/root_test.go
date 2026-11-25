@@ -11,6 +11,7 @@ import (
 	"github.com/JOsee321/Rotex/internal/aws"
 	"github.com/JOsee321/Rotex/internal/github"
 	"github.com/JOsee321/Rotex/internal/model"
+	"github.com/JOsee321/Rotex/internal/rotate"
 	"github.com/JOsee321/Rotex/internal/security"
 )
 
@@ -255,5 +256,99 @@ func TestBlastCommandExecution(t *testing.T) {
 	}
 	if len(report.Packages) != 1 || report.Packages[0] != "evil-pkg@1.0.0" {
 		t.Fatalf("unexpected blast report: %+v", report)
+	}
+}
+
+type stubRotator struct{}
+
+func (s *stubRotator) Name() string { return "stub-aws" }
+func (s *stubRotator) PreflightCheck(_ context.Context, _ rotate.KeyTarget) (*rotate.PreflightInfo, error) {
+	return &rotate.PreflightInfo{ResolvedOldKeyID: "AKIA_OLD", ExistingKeyCount: 1}, nil
+}
+func (s *stubRotator) MintKey(_ context.Context, _ rotate.KeyTarget) (*rotate.SecretMaterial, error) {
+	return &rotate.SecretMaterial{
+		KeyID: "AKIA_NEW",
+		Values: map[string]*security.SensitiveBytes{
+			"AWS_ACCESS_KEY_ID":     security.NewSensitiveBytes([]byte("AKIA_NEW")),
+			"AWS_SECRET_ACCESS_KEY": security.NewSensitiveBytes([]byte("secret_new_value")),
+		},
+	}, nil
+}
+func (s *stubRotator) VerifyKey(_ context.Context, _ *rotate.SecretMaterial) error        { return nil }
+func (s *stubRotator) DeactivateKey(_ context.Context, _ rotate.KeyTarget, _ string) error { return nil }
+func (s *stubRotator) ReactivateKey(_ context.Context, _ rotate.KeyTarget, _ string) error { return nil }
+func (s *stubRotator) DeleteKey(_ context.Context, _ rotate.KeyTarget, _ string) error     { return nil }
+
+type stubSecretStore struct{}
+
+func (s *stubSecretStore) Name() string                                             { return "stub-gh" }
+func (s *stubSecretStore) PreflightScope(_ context.Context, _ rotate.StoreScope) error { return nil }
+func (s *stubSecretStore) UpdateSecret(_ context.Context, _ rotate.StoreScope, _ string, _ *security.SensitiveBytes) error {
+	return nil
+}
+
+func TestRotateDryRunApplyRollbackCleanupCommands(t *testing.T) {
+	stateDir := t.TempDir()
+	deps := Dependencies{
+		LookupEnv: func(key string) string {
+			if key == "GITHUB_TOKEN" {
+				return "ghp_mock"
+			}
+			return ""
+		},
+		AWSRotatorFactory: func(_ context.Context, _, _ string, _, _ time.Duration) (rotate.CredentialProvider, error) {
+			return &stubRotator{}, nil
+		},
+		SecretStoreFactory: func(_ security.SensitiveString, _ string) rotate.SecretStore {
+			return &stubSecretStore{}
+		},
+	}
+
+	// Dry-run plan
+	var planOut bytes.Buffer
+	planCmd := NewRootCommandWithDeps(deps)
+	planCmd.SetOut(&planOut)
+	planCmd.SetArgs([]string{"rotate", "--iam-user", "ci-bot", "--repo", "acme/api", "--dry-run", "--format", "json"})
+	if err := planCmd.Execute(); err != nil {
+		t.Fatalf("rotate --dry-run failed: %v", err)
+	}
+	var plan rotate.ExecutionPlan
+	if err := json.Unmarshal(planOut.Bytes(), &plan); err != nil {
+		t.Fatalf("invalid plan JSON: %v", err)
+	}
+	if plan.Target.OldKeyID != "AKIA_OLD" {
+		t.Fatalf("unexpected plan: %+v", plan)
+	}
+
+	// Apply
+	var applyOut bytes.Buffer
+	applyCmd := NewRootCommandWithDeps(deps)
+	applyCmd.SetOut(&applyOut)
+	applyCmd.SetArgs([]string{"rotate", "--iam-user", "ci-bot", "--repo", "acme/api", "--apply", "--state-dir", stateDir, "--format", "json"})
+	if err := applyCmd.Execute(); err != nil {
+		t.Fatalf("rotate --apply failed: %v", err)
+	}
+	if strings.Contains(applyOut.String(), "secret_new_value") {
+		t.Fatalf("rotate output leaked secret material")
+	}
+	var state rotate.RunState
+	if err := json.Unmarshal(applyOut.Bytes(), &state); err != nil {
+		t.Fatalf("invalid state JSON: %v", err)
+	}
+	if state.Stage != rotate.StageCompleted {
+		t.Fatalf("expected COMPLETED stage, got %s", state.Stage)
+	}
+
+	// Cleanup
+	var cleanOut bytes.Buffer
+	cleanCmd := NewRootCommandWithDeps(deps)
+	cleanCmd.SetOut(&cleanOut)
+	cleanCmd.SetArgs([]string{"cleanup", "--run-id", state.RunID, "--state-dir", stateDir, "--format", "json"})
+	if err := cleanCmd.Execute(); err != nil {
+		t.Fatalf("cleanup failed: %v", err)
+	}
+	var cleaned rotate.RunState
+	if err := json.Unmarshal(cleanOut.Bytes(), &cleaned); err != nil || cleaned.Stage != rotate.StageRevoked {
+		t.Fatalf("unexpected cleanup result: %+v, err=%v", cleaned, err)
 	}
 }

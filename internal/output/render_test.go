@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/JOsee321/Rotex/internal/model"
+	"github.com/JOsee321/Rotex/internal/rotate"
 )
 
 func sampleReport() *model.ScanReport {
@@ -142,5 +143,46 @@ func TestRenderBlastFormats(t *testing.T) {
 	}
 	if len(decoded.RotationQueue) != 1 {
 		t.Fatalf("unexpected decoded blast report: %+v", decoded)
+	}
+}
+
+func TestRenderRotationPlanAndState(t *testing.T) {
+	plan := &rotate.ExecutionPlan{
+		Provider: "aws-iam",
+		Target:   rotate.KeyTarget{IAMUser: "ci-bot", OldKeyID: "AKIA_OLD"},
+		Preflight: &rotate.PreflightInfo{
+			ResolvedOldKeyID: "AKIA_OLD",
+			ExistingKeyCount: 1,
+		},
+		SecretNames:  []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"},
+		StoreTargets: []rotate.StoreScope{{Scope: model.ScopeRepo, Repo: "acme/api"}},
+	}
+
+	var planBuf bytes.Buffer
+	if err := RenderRotationPlan(&planBuf, plan, Options{Format: FormatTable}); err != nil {
+		t.Fatalf("RenderRotationPlan failed: %v", err)
+	}
+	if !strings.Contains(planBuf.String(), "[DRY-RUN]") || !strings.Contains(planBuf.String(), "AKIA_OLD") {
+		t.Fatalf("unexpected plan output:\n%s", planBuf.String())
+	}
+
+	state := &rotate.RunState{
+		RunID:          "rot-1",
+		Target:         rotate.KeyTarget{IAMUser: "ci-bot"},
+		OldKeyID:       "AKIA_OLD",
+		NewKeyID:       "AKIA_NEW",
+		Stage:          rotate.StageCompleted,
+		OldDeactivated: true,
+		Targets: []rotate.TargetInjectionStatus{
+			{Target: rotate.StoreScope{Scope: model.ScopeRepo, Repo: "acme/api"}, Status: "INJECTED"},
+		},
+	}
+
+	var stateBuf bytes.Buffer
+	if err := RenderRunState(&stateBuf, state, Options{Format: FormatMarkdown}); err != nil {
+		t.Fatalf("RenderRunState failed: %v", err)
+	}
+	if !strings.Contains(stateBuf.String(), "rot-1") || !strings.Contains(stateBuf.String(), "COMPLETED") {
+		t.Fatalf("unexpected state output:\n%s", stateBuf.String())
 	}
 }

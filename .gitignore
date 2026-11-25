@@ -39,8 +39,9 @@ go.work.sum
 *.key
 credentials.json
 
-# Local planning documents
+# Local planning documents & runtime state
 PRD.md
+.rotex/
 
 # Editor/IDE
 # .idea/
