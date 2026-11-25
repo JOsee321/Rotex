@@ -61,12 +61,20 @@ func WithAWSInspector(insp aws.Inspector) Option {
 	}
 }
 
+// WithAllowUnauthenticated enables read-only blast analysis without a GitHub token.
+func WithAllowUnauthenticated(allow bool) Option {
+	return func(s *Service) {
+		s.allowUnauthenticated = allow
+	}
+}
+
 // Service correlates dependency lockfiles, GitHub Actions run history, and secret exposures.
 type Service struct {
-	gh          github.Client
-	aws         aws.Inspector
-	now         func() time.Time
-	concurrency int
+	gh                   github.Client
+	aws                  aws.Inspector
+	now                  func() time.Time
+	concurrency          int
+	allowUnauthenticated bool
 }
 
 // NewService constructs a read-only blast radius Service.
@@ -106,25 +114,34 @@ func (s *Service) Analyze(ctx context.Context, req Request) (*model.BlastReport,
 	}
 
 	now := s.now().UTC()
-	scannerOpts := []scanner.Option{
-		scanner.WithClock(func() time.Time { return now }),
-		scanner.WithConcurrency(s.concurrency),
-	}
-	if s.aws != nil {
-		scannerOpts = append(scannerOpts, scanner.WithAWSInspector(s.aws))
-	}
-
-	scanReport, err := scanner.NewService(s.gh, scannerOpts...).Scan(ctx, req.Target)
-	if err != nil {
-		return nil, err
-	}
-
 	repos, err := s.resolveRepos(ctx, req.Target)
 	if err != nil {
 		return nil, err
 	}
 
-	repoResults, err := s.inspectReposBounded(ctx, repos, req.Packages, now.Add(-since))
+	scannerOpts := []scanner.Option{
+		scanner.WithClock(func() time.Time { return now }),
+		scanner.WithConcurrency(s.concurrency),
+		scanner.WithAllowUnauthenticated(s.allowUnauthenticated),
+	}
+	if s.aws != nil {
+		scannerOpts = append(scannerOpts, scanner.WithAWSInspector(s.aws))
+	}
+
+	scanReport, err := scanner.NewService(s.gh, scannerOpts...).ScanRepos(ctx, req.Target, repos)
+	if err != nil {
+		return nil, err
+	}
+
+	var activeRepos []github.Repository
+	for _, r := range repos {
+		if r.Archived && !req.Target.IncludeArchived {
+			continue
+		}
+		activeRepos = append(activeRepos, r)
+	}
+
+	repoResults, err := s.inspectReposBounded(ctx, activeRepos, req.Packages, now.Add(-since))
 	if err != nil {
 		return nil, err
 	}
@@ -166,26 +183,12 @@ func (s *Service) Analyze(ctx context.Context, req Request) (*model.BlastReport,
 
 func (s *Service) resolveRepos(ctx context.Context, target model.ScanTarget) ([]github.Repository, error) {
 	if target.Org != "" {
-		all, err := s.gh.ListOrgRepos(ctx, target.Org)
-		if err != nil {
-			return nil, err
-		}
-		var active []github.Repository
-		for _, r := range all {
-			if r.Archived && !target.IncludeArchived {
-				continue
-			}
-			active = append(active, r)
-		}
-		return active, nil
+		return s.gh.ListOrgRepos(ctx, target.Org)
 	}
 	owner, name, _ := strings.Cut(target.Repo, "/")
 	repo, err := s.gh.GetRepo(ctx, owner, name)
 	if err != nil {
 		return nil, err
-	}
-	if repo.Archived && !target.IncludeArchived {
-		return nil, nil
 	}
 	return []github.Repository{repo}, nil
 }
@@ -241,7 +244,7 @@ func (s *Service) inspectSingleRepo(ctx context.Context, repo github.Repository,
 
 	lockfiles, err := s.gh.ListRepoLockfiles(ctx, repo.Owner, repo.Name, repo.DefaultBranch)
 	if err != nil {
-		if github.IsPermissionDenied(err) || github.IsNotFound(err) {
+		if s.isDegradable(err) {
 			res.warnings = append(res.warnings, model.ScanWarning{
 				Scope:   "lockfile",
 				Target:  repo.FullName,
@@ -282,7 +285,7 @@ func (s *Service) inspectSingleRepo(ctx context.Context, repo github.Repository,
 
 	runs, runsErr := s.gh.ListWorkflowRuns(ctx, repo.Owner, repo.Name, since)
 	if runsErr != nil {
-		if github.IsPermissionDenied(runsErr) || github.IsNotFound(runsErr) {
+		if s.isDegradable(runsErr) {
 			res.warnings = append(res.warnings, model.ScanWarning{
 				Scope:   "workflow_runs",
 				Target:  repo.FullName,
@@ -424,6 +427,13 @@ func formatSpecs(specs []lockfile.PackageSpec) []string {
 		}
 	}
 	return out
+}
+
+func (s *Service) isDegradable(err error) bool {
+	if github.IsPermissionDenied(err) || github.IsNotFound(err) {
+		return true
+	}
+	return s.allowUnauthenticated && github.IsUnauthorized(err)
 }
 
 func appendUniqueStr(dst []string, val string) []string {

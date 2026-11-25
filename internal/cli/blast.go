@@ -91,9 +91,6 @@ func runBlast(cmd *cobra.Command, deps Dependencies, opts *blastOptions, noColor
 	}
 
 	token := resolveGitHubToken(deps.LookupEnv)
-	if token.IsEmpty() {
-		return errors.New("GITHUB_TOKEN (or GH_TOKEN) environment variable is required")
-	}
 
 	apiURL := strings.TrimSpace(opts.apiURL)
 	if apiURL == "" {
@@ -101,7 +98,10 @@ func runBlast(cmd *cobra.Command, deps Dependencies, opts *blastOptions, noColor
 	}
 
 	ghClient := deps.GitHubClientFactory(token, apiURL)
-	blastOpts := []blast.Option{blast.WithConcurrency(opts.concurrency)}
+	blastOpts := []blast.Option{
+		blast.WithConcurrency(opts.concurrency),
+		blast.WithAllowUnauthenticated(token.IsEmpty()),
+	}
 	if opts.withAWS {
 		insp, awsErr := deps.AWSInspectorFactory(cmd.Context())
 		if awsErr != nil {

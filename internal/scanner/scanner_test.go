@@ -205,8 +205,52 @@ jobs:
 		}
 	}
 
-	if !slices.Contains(byName["MISSING_ORG_SECRET"].RiskFlags, model.RiskUndefinedSecret) {
-		t.Fatalf("expected MISSING_ORG_SECRET to be flagged undefined_secret")
+	if slices.Contains(byName["MISSING_ORG_SECRET"].RiskFlags, model.RiskUndefinedSecret) {
+		t.Fatalf("should not falsely flag MISSING_ORG_SECRET as undefined_secret when org/env secrets returned 403")
+	}
+}
+
+func TestScanFlagsUndefinedSecretOnlyWhenInventoryReadableAndFailsOnRateLimit(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	client := &mockGitHubClient{
+		repos: []github.Repository{
+			{Owner: "acme", Name: "api", FullName: "acme/api", DefaultBranch: "main"},
+		},
+		workflows: map[string][]github.WorkflowFile{
+			"acme/api": {
+				{
+					Path:    ".github/workflows/ci.yml",
+					Content: []byte("on: push\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n        env:\n          NOPE: ${{ secrets.TRULY_UNDEFINED }}\n"),
+				},
+			},
+		},
+	}
+
+	svc := NewService(client, WithClock(func() time.Time { return now }))
+	report, err := svc.Scan(context.Background(), model.ScanTarget{Repo: "acme/api"})
+	if err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+	if !slices.Contains(report.Exposures[0].RiskFlags, model.RiskUndefinedSecret) {
+		t.Fatalf("expected undefined_secret when inventory is readable, got %v", report.Exposures[0].RiskFlags)
+	}
+
+	// Rate limit 403 must return an error instead of degrading silently.
+	rlClient := &mockGitHubClient{
+		repos: []github.Repository{
+			{Owner: "acme", Name: "api", FullName: "acme/api", DefaultBranch: "main"},
+		},
+		repoSecErr: map[string]error{
+			"acme/api": &github.APIError{
+				StatusCode: http.StatusForbidden,
+				Message:    "API rate limit exceeded",
+				Endpoint:   "/repos/acme/api/actions/secrets",
+			},
+		},
+	}
+	rlSvc := NewService(rlClient, WithAllowUnauthenticated(true))
+	if _, err := rlSvc.Scan(context.Background(), model.ScanTarget{Repo: "acme/api"}); err == nil || !github.IsRateLimited(err) {
+		t.Fatalf("expected fatal rate-limit error, got %v", err)
 	}
 }
 

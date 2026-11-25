@@ -73,14 +73,23 @@ func WithAWSLookback(d time.Duration) Option {
 	}
 }
 
+// WithAllowUnauthenticated allows read-only scanning without a GitHub token,
+// degrading HTTP 401 secret metadata responses into explicit warnings.
+func WithAllowUnauthenticated(allow bool) Option {
+	return func(s *Service) {
+		s.allowUnauthenticated = allow
+	}
+}
+
 // Service orchestrates read-only secret discovery and workflow exposure mapping.
 type Service struct {
-	gh          github.Client
-	aws         aws.Inspector
-	awsLookback time.Duration
-	now         func() time.Time
-	concurrency int
-	staleDays   int
+	gh                   github.Client
+	aws                  aws.Inspector
+	awsLookback          time.Duration
+	now                  func() time.Time
+	concurrency          int
+	staleDays            int
+	allowUnauthenticated bool
 }
 
 // NewService constructs a read-only scanner Service.
@@ -101,15 +110,57 @@ func NewService(gh github.Client, opts ...Option) *Service {
 }
 
 type repoScanResult struct {
-	repo       github.Repository
-	secrets    []model.SecretMetadata
-	workflows  []*workflow.ParsedWorkflow
-	warnings   []model.ScanWarning
-	fatalError error
+	repo            github.Repository
+	secrets         []model.SecretMetadata
+	secretsReadable bool
+	workflows       []*workflow.ParsedWorkflow
+	warnings        []model.ScanWarning
+	fatalError      error
 }
 
 // Scan discovers secrets and workflow usages across the requested org or single repository.
 func (s *Service) Scan(ctx context.Context, target model.ScanTarget) (*model.ScanReport, error) {
+	if s.gh == nil {
+		return nil, errors.New("github client must not be nil")
+	}
+	if err := validateTarget(target); err != nil {
+		return nil, err
+	}
+
+	var activeRepos []github.Repository
+	var skipped int
+
+	if target.Org != "" {
+		repos, err := s.gh.ListOrgRepos(ctx, target.Org)
+		if err != nil {
+			return nil, fmt.Errorf("list repositories for org %s: %w", target.Org, err)
+		}
+		for _, r := range repos {
+			if r.Archived && !target.IncludeArchived {
+				skipped++
+				continue
+			}
+			activeRepos = append(activeRepos, r)
+		}
+	} else {
+		owner, name, _ := strings.Cut(target.Repo, "/")
+		repo, err := s.gh.GetRepo(ctx, owner, name)
+		if err != nil {
+			return nil, fmt.Errorf("get repository %s: %w", target.Repo, err)
+		}
+		activeRepos = append(activeRepos, repo)
+	}
+
+	report, err := s.ScanRepos(ctx, target, activeRepos)
+	if err != nil {
+		return nil, err
+	}
+	report.Summary.ReposSkipped += skipped
+	return report, nil
+}
+
+// ScanRepos scans a pre-resolved slice of repositories without re-fetching repo metadata.
+func (s *Service) ScanRepos(ctx context.Context, target model.ScanTarget, repos []github.Repository) (*model.ScanReport, error) {
 	if s.gh == nil {
 		return nil, errors.New("github client must not be nil")
 	}
@@ -122,26 +173,39 @@ func (s *Service) Scan(ctx context.Context, target model.ScanTarget) (*model.Sca
 		Target:      target,
 		GeneratedAt: now,
 	}
+	if s.allowUnauthenticated {
+		report.Warnings = append(report.Warnings, model.ScanWarning{
+			Scope:   "auth",
+			Target:  "github",
+			Code:    "unauthenticated",
+			Message: "GITHUB_TOKEN not set; running unauthenticated (60 req/hr limit, secret metadata inaccessible)",
+		})
+	}
 
 	var activeRepos []github.Repository
-	var orgSecrets []model.SecretMetadata
-
-	if target.Org != "" {
-		repos, err := s.gh.ListOrgRepos(ctx, target.Org)
-		if err != nil {
-			return nil, fmt.Errorf("list repositories for org %s: %w", target.Org, err)
-		}
-		for _, r := range repos {
-			if r.Archived && !target.IncludeArchived {
-				report.Summary.ReposSkipped++
-				continue
+	for _, r := range repos {
+		if r.Archived && !target.IncludeArchived {
+			report.Summary.ReposSkipped++
+			if target.Repo != "" {
+				report.Warnings = append(report.Warnings, model.ScanWarning{
+					Scope:   string(model.ScopeRepo),
+					Target:  r.FullName,
+					Code:    "archived_skipped",
+					Message: "archived repository skipped (pass --include-archived to scan)",
+				})
 			}
-			activeRepos = append(activeRepos, r)
+			continue
 		}
+		activeRepos = append(activeRepos, r)
+	}
 
+	var orgSecrets []model.SecretMetadata
+	orgSecretsReadable := true
+	if target.Org != "" {
 		secrets, err := s.gh.ListOrgSecrets(ctx, target.Org)
 		if err != nil {
-			if isDegradableError(err) {
+			if s.isDegradable(err) {
+				orgSecretsReadable = false
 				report.Warnings = append(report.Warnings, model.ScanWarning{
 					Scope:   string(model.ScopeOrg),
 					Target:  target.Org,
@@ -154,23 +218,6 @@ func (s *Service) Scan(ctx context.Context, target model.ScanTarget) (*model.Sca
 		} else {
 			orgSecrets = secrets
 		}
-	} else {
-		owner, name, _ := strings.Cut(target.Repo, "/")
-		repo, err := s.gh.GetRepo(ctx, owner, name)
-		if err != nil {
-			return nil, fmt.Errorf("get repository %s: %w", target.Repo, err)
-		}
-		if repo.Archived && !target.IncludeArchived {
-			report.Summary.ReposSkipped++
-			report.Warnings = append(report.Warnings, model.ScanWarning{
-				Scope:   string(model.ScopeRepo),
-				Target:  repo.FullName,
-				Code:    "archived_skipped",
-				Message: "archived repository skipped (pass --include-archived to scan)",
-			})
-		} else {
-			activeRepos = append(activeRepos, repo)
-		}
 	}
 
 	results, err := s.scanReposBounded(ctx, activeRepos)
@@ -178,7 +225,7 @@ func (s *Service) Scan(ctx context.Context, target model.ScanTarget) (*model.Sca
 		return nil, err
 	}
 
-	s.aggregate(report, orgSecrets, results, now)
+	s.aggregate(report, orgSecrets, orgSecretsReadable, results, now)
 
 	if s.aws != nil {
 		if err := s.correlateAWS(ctx, report); err != nil {
@@ -359,11 +406,12 @@ dispatchLoop:
 }
 
 func (s *Service) scanSingleRepo(ctx context.Context, repo github.Repository) repoScanResult {
-	res := repoScanResult{repo: repo}
+	res := repoScanResult{repo: repo, secretsReadable: true}
 
 	repoSecrets, err := s.gh.ListRepoSecrets(ctx, repo.Owner, repo.Name)
 	if err != nil {
-		if isDegradableError(err) {
+		if s.isDegradable(err) {
+			res.secretsReadable = false
 			res.warnings = append(res.warnings, model.ScanWarning{
 				Scope:   string(model.ScopeRepo),
 				Target:  repo.FullName,
@@ -378,46 +426,51 @@ func (s *Service) scanSingleRepo(ctx context.Context, repo github.Repository) re
 		res.secrets = append(res.secrets, repoSecrets...)
 	}
 
-	envs, err := s.gh.ListEnvironments(ctx, repo.Owner, repo.Name)
-	if err != nil {
-		if isDegradableError(err) {
-			res.warnings = append(res.warnings, model.ScanWarning{
-				Scope:   string(model.ScopeEnvironment),
-				Target:  repo.FullName,
-				Code:    warningCode(err),
-				Message: fmt.Sprintf("unable to list environments: %v", err),
-			})
+	// Skip environment secret enumeration if unauthenticated repo secret access already failed with 401.
+	if !(s.allowUnauthenticated && !res.secretsReadable) {
+		envs, err := s.gh.ListEnvironments(ctx, repo.Owner, repo.Name)
+		if err != nil {
+			if s.isDegradable(err) {
+				res.secretsReadable = false
+				res.warnings = append(res.warnings, model.ScanWarning{
+					Scope:   string(model.ScopeEnvironment),
+					Target:  repo.FullName,
+					Code:    warningCode(err),
+					Message: fmt.Sprintf("unable to list environments: %v", err),
+				})
+			} else {
+				res.fatalError = fmt.Errorf("list environments for %s: %w", repo.FullName, err)
+				return res
+			}
 		} else {
-			res.fatalError = fmt.Errorf("list environments for %s: %w", repo.FullName, err)
-			return res
-		}
-	} else {
-		for _, env := range envs {
-			if ctx.Err() != nil {
-				res.fatalError = ctx.Err()
-				return res
-			}
-			envSecrets, envErr := s.gh.ListEnvironmentSecrets(ctx, repo.Owner, repo.Name, env.Name)
-			if envErr != nil {
-				if isDegradableError(envErr) {
-					res.warnings = append(res.warnings, model.ScanWarning{
-						Scope:   string(model.ScopeEnvironment),
-						Target:  repo.FullName + "/" + env.Name,
-						Code:    warningCode(envErr),
-						Message: fmt.Sprintf("unable to read environment secrets: %v", envErr),
-					})
-					continue
+			for _, env := range envs {
+				if ctx.Err() != nil {
+					res.fatalError = ctx.Err()
+					return res
 				}
-				res.fatalError = fmt.Errorf("list environment secrets for %s/%s: %w", repo.FullName, env.Name, envErr)
-				return res
+				envSecrets, envErr := s.gh.ListEnvironmentSecrets(ctx, repo.Owner, repo.Name, env.Name)
+				if envErr != nil {
+					if s.isDegradable(envErr) {
+						res.secretsReadable = false
+						res.warnings = append(res.warnings, model.ScanWarning{
+							Scope:   string(model.ScopeEnvironment),
+							Target:  repo.FullName + "/" + env.Name,
+							Code:    warningCode(envErr),
+							Message: fmt.Sprintf("unable to read environment secrets: %v", envErr),
+						})
+						continue
+					}
+					res.fatalError = fmt.Errorf("list environment secrets for %s/%s: %w", repo.FullName, env.Name, envErr)
+					return res
+				}
+				res.secrets = append(res.secrets, envSecrets...)
 			}
-			res.secrets = append(res.secrets, envSecrets...)
 		}
 	}
 
 	wfFiles, err := s.gh.ListWorkflowFiles(ctx, repo.Owner, repo.Name, repo.DefaultBranch)
 	if err != nil {
-		if isDegradableError(err) {
+		if s.isDegradable(err) {
 			res.warnings = append(res.warnings, model.ScanWarning{
 				Scope:   "workflow",
 				Target:  repo.FullName,
@@ -447,8 +500,9 @@ func (s *Service) scanSingleRepo(ctx context.Context, repo github.Repository) re
 	return res
 }
 
-func (s *Service) aggregate(report *model.ScanReport, orgSecrets []model.SecretMetadata, results []repoScanResult, now time.Time) {
+func (s *Service) aggregate(report *model.ScanReport, orgSecrets []model.SecretMetadata, orgSecretsReadable bool, results []repoScanResult, now time.Time) {
 	exposures := make(map[string]*model.SecretExposure)
+	repoSecretsReadable := make(map[string]bool, len(results))
 	getOrCreate := func(secretName string) *model.SecretExposure {
 		upper := strings.ToUpper(secretName)
 		if exp, ok := exposures[upper]; ok {
@@ -470,6 +524,7 @@ func (s *Service) aggregate(report *model.ScanReport, orgSecrets []model.SecretM
 	report.Summary.ReposScanned = len(results)
 
 	for _, res := range results {
+		repoSecretsReadable[res.repo.FullName] = res.secretsReadable
 		report.Warnings = append(report.Warnings, res.warnings...)
 		report.Summary.WorkflowsParsed += len(res.workflows)
 
@@ -536,7 +591,19 @@ func (s *Service) aggregate(report *model.ScanReport, orgSecrets []model.SecretM
 			exp.RiskFlags = appendUniqueRiskFlag(exp.RiskFlags, model.RiskUnreferencedSecret)
 		}
 		if len(exp.Definitions) == 0 && len(exp.WorkflowRefs) > 0 {
-			exp.RiskFlags = appendUniqueRiskFlag(exp.RiskFlags, model.RiskUndefinedSecret)
+			// Only flag undefined_secret when we could inspect repo secret inventory.
+			// Org secret visibility gaps (403 on org secrets) should still allow warning if repo secrets were readable,
+			// unless unauthenticated/repo-level 401/403 prevented reading any secret inventory at all.
+			allReposReadable := len(exp.Repos) > 0
+			for _, r := range exp.Repos {
+				if !repoSecretsReadable[r] {
+					allReposReadable = false
+					break
+				}
+			}
+			if allReposReadable && (report.Target.Org == "" || orgSecretsReadable) {
+				exp.RiskFlags = appendUniqueRiskFlag(exp.RiskFlags, model.RiskUndefinedSecret)
+			}
 		}
 
 		sortExposureFields(exp)
@@ -614,14 +681,19 @@ func validateTarget(target model.ScanTarget) error {
 	return nil
 }
 
-func isDegradableError(err error) bool {
-	return github.IsPermissionDenied(err) || github.IsNotFound(err)
+func (s *Service) isDegradable(err error) bool {
+	if github.IsPermissionDenied(err) || github.IsNotFound(err) {
+		return true
+	}
+	return s.allowUnauthenticated && github.IsUnauthorized(err)
 }
 
 func warningCode(err error) string {
 	var apiErr *github.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.StatusCode {
+		case http.StatusUnauthorized:
+			return "unauthorized"
 		case http.StatusForbidden:
 			return "permission_denied"
 		case http.StatusNotFound:

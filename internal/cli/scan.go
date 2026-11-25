@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"errors"
 	"strings"
 
 	"github.com/JOsee321/Rotex/internal/model"
@@ -58,9 +57,6 @@ func runScan(cmd *cobra.Command, deps Dependencies, opts *scanOptions, noColor *
 	}
 
 	token := resolveGitHubToken(deps.LookupEnv)
-	if token.IsEmpty() {
-		return errors.New("GITHUB_TOKEN (or GH_TOKEN) environment variable is required")
-	}
 
 	apiURL := strings.TrimSpace(opts.apiURL)
 	if apiURL == "" {
@@ -68,7 +64,10 @@ func runScan(cmd *cobra.Command, deps Dependencies, opts *scanOptions, noColor *
 	}
 
 	ghClient := deps.GitHubClientFactory(token, apiURL)
-	scannerOpts := []scanner.Option{scanner.WithConcurrency(opts.concurrency)}
+	scannerOpts := []scanner.Option{
+		scanner.WithConcurrency(opts.concurrency),
+		scanner.WithAllowUnauthenticated(token.IsEmpty()),
+	}
 
 	if opts.withAWS {
 		insp, awsErr := deps.AWSInspectorFactory(cmd.Context())

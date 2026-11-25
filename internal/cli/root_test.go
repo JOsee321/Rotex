@@ -156,13 +156,32 @@ func TestScanCommandExecutionJSONAndValidation(t *testing.T) {
 		t.Fatalf("unexpected report: %+v", report)
 	}
 
-	// Missing token check.
+	// Unauthenticated scan should degrade gracefully with a warning.
+	var unauthOut bytes.Buffer
 	noTokCmd := NewRootCommandWithDeps(Dependencies{
+		LookupEnv:           func(string) string { return "" },
+		GitHubClientFactory: func(_ security.SensitiveString, _ string) github.Client { return stub },
+	})
+	noTokCmd.SetOut(&unauthOut)
+	noTokCmd.SetArgs([]string{"scan", "--repo", "octocat/hello", "--format", "json"})
+	if err := noTokCmd.Execute(); err != nil {
+		t.Fatalf("expected unauthenticated scan to succeed with warning, got: %v", err)
+	}
+	var unauthRep model.ScanReport
+	if err := json.Unmarshal(unauthOut.Bytes(), &unauthRep); err != nil {
+		t.Fatalf("invalid unauthenticated scan JSON: %v", err)
+	}
+	if len(unauthRep.Warnings) == 0 || unauthRep.Warnings[0].Code != "unauthenticated" {
+		t.Fatalf("expected unauthenticated warning, got: %+v", unauthRep.Warnings)
+	}
+
+	// Write command (rotate) must still reject missing token.
+	rotNoTok := NewRootCommandWithDeps(Dependencies{
 		LookupEnv: func(string) string { return "" },
 	})
-	noTokCmd.SetArgs([]string{"scan", "--repo", "octocat/hello"})
-	if err := noTokCmd.Execute(); err == nil || !strings.Contains(err.Error(), "GITHUB_TOKEN") {
-		t.Fatalf("expected missing token error, got: %v", err)
+	rotNoTok.SetArgs([]string{"rotate", "--iam-user", "ci", "--repo", "octocat/hello"})
+	if err := rotNoTok.Execute(); err == nil || !strings.Contains(err.Error(), "GITHUB_TOKEN") {
+		t.Fatalf("expected missing token error on rotate, got: %v", err)
 	}
 }
 
