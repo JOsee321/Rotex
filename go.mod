@@ -9,6 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/iam v1.68.0
 	github.com/aws/smithy-go v1.28.9
 	github.com/spf13/cobra v1.10.2
+	golang.org/x/crypto v0.59.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -26,4 +27,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.53.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 )
