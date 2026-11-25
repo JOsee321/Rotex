@@ -1,6 +1,8 @@
 package workflow
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -180,6 +182,37 @@ func TestParseWorkflowErrorsAndEmpty(t *testing.T) {
 
 	if _, err := Parse(".github/workflows/bad.yml", []byte(":::invalid: [")); err == nil {
 		t.Fatalf("expected error on malformed YAML")
+	}
+}
+
+func TestDogfoodRepositoryWorkflowsHaveNoRiskFlags(t *testing.T) {
+	for _, rel := range []string{".github/workflows/ci.yml", ".github/workflows/release.yml"} {
+		full := filepath.Join("..", "..", filepath.FromSlash(rel))
+		content, err := os.ReadFile(full)
+		if err != nil {
+			t.Fatalf("read %s failed: %v", rel, err)
+		}
+		if !IsWorkflowFile(rel) {
+			t.Fatalf("expected %s to be recognized as workflow file", rel)
+		}
+		parsed, err := Parse(rel, content)
+		if err != nil {
+			t.Fatalf("parse %s failed: %v", rel, err)
+		}
+		if len(parsed.WorkflowRiskFlags) > 0 {
+			t.Fatalf("%s has unexpected workflow risk flags: %v", rel, parsed.WorkflowRiskFlags)
+		}
+		if len(parsed.UnpinnedUses) > 0 {
+			t.Fatalf("%s has unpinned actions: %v", rel, parsed.UnpinnedUses)
+		}
+		for _, ref := range parsed.References {
+			if len(ref.RiskFlags) > 0 || len(ref.UnpinnedUses) > 0 {
+				t.Fatalf("%s secret ref %+v has risk flags/unpinned uses", rel, ref)
+			}
+		}
+		if len(parsed.InheritJobs) > 0 {
+			t.Fatalf("%s has unexpected secrets: inherit jobs: %+v", rel, parsed.InheritJobs)
+		}
 	}
 }
 

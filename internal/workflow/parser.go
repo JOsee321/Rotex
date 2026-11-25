@@ -51,6 +51,7 @@ type ParsedWorkflow struct {
 	Name              string
 	Triggers          []string
 	WorkflowRiskFlags []model.RiskFlag
+	UnpinnedUses      []string
 	References        []SecretUsage
 	InheritJobs       []InheritJob
 }
@@ -135,6 +136,7 @@ func Parse(path string, content []byte) (*ParsedWorkflow, error) {
 		}
 		workflowLevelRefs[i].RiskFlags = flags
 	}
+	result.UnpinnedUses = slices.Clone(anyJobUnpinned)
 	result.References = append(workflowLevelRefs, result.References...)
 
 	return result, nil
