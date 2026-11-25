@@ -1,0 +1,52 @@
+version: 2
+
+project_name: rotex
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: rotex
+    main: ./cmd/rotex
+    binary: rotex
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/JOsee321/Rotex/internal/version.Version={{.Version}}
+      - -X github.com/JOsee321/Rotex/internal/version.Commit={{.ShortCommit}}
+      - -X github.com/JOsee321/Rotex/internal/version.Date={{.Date}}
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
