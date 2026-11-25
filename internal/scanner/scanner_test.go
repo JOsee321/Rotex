@@ -8,9 +8,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JOsee321/Rotex/internal/aws"
 	"github.com/JOsee321/Rotex/internal/github"
 	"github.com/JOsee321/Rotex/internal/model"
 )
+
+type mockAWSInspector struct {
+	report *aws.AuditReport
+	err    error
+}
+
+func (m *mockAWSInspector) Inspect(_ context.Context, _ time.Duration) (*aws.AuditReport, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.report, nil
+}
 
 type mockGitHubClient struct {
 	repos      []github.Repository
@@ -236,5 +249,63 @@ func TestScanSingleRepoWithoutOrgAccess(t *testing.T) {
 	}
 	if !slices.Contains(report.Exposures[0].RiskFlags, model.RiskUnreferencedSecret) {
 		t.Fatalf("expected unreferenced_secret flag, got %v", report.Exposures[0].RiskFlags)
+	}
+}
+
+func TestScanWithAWSCorrelation(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	client := &mockGitHubClient{
+		repos: []github.Repository{
+			{Owner: "acme", Name: "api", FullName: "acme/api", DefaultBranch: "main"},
+		},
+		repoSecrets: map[string][]model.SecretMetadata{
+			"acme/api": {
+				{Name: "AWS_ACCESS_KEY_ID", Scope: model.ScopeRepo, Owner: "acme", Repo: "acme/api", UpdatedAt: now.Add(-10 * 24 * time.Hour)},
+			},
+		},
+		workflows: map[string][]github.WorkflowFile{
+			"acme/api": {
+				{
+					Path:    ".github/workflows/ci.yml",
+					Content: []byte("on: push\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n      - run: echo hi\n        env:\n          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}\n"),
+				},
+			},
+		},
+	}
+
+	awsInsp := &mockAWSInspector{
+		report: &aws.AuditReport{
+			Keys: []aws.AccessKeyAudit{
+				{
+					UserName:          "ci-deployer",
+					AccessKeyID:       "AKIAEXAMPLE123",
+					Status:            "Active",
+					AgeDays:           150,
+					Stale:             true,
+					Overprivileged:    true,
+					GitHubRunnerSeen:  true,
+					ExternalUsageSeen: true,
+					ExternalSources:   []string{"aws-cli@198.51.100.1"},
+				},
+			},
+		},
+	}
+
+	svc := NewService(client, WithClock(func() time.Time { return now }), WithAWSInspector(awsInsp))
+	report, err := svc.Scan(context.Background(), model.ScanTarget{Repo: "acme/api"})
+	if err != nil {
+		t.Fatalf("Scan with AWS failed: %v", err)
+	}
+	if len(report.AWSKeys) != 1 {
+		t.Fatalf("expected 1 AWS key, got %d", len(report.AWSKeys))
+	}
+	exp := report.Exposures[0]
+	if exp.AWS == nil || exp.AWS.AccessKeyID != "AKIAEXAMPLE123" {
+		t.Fatalf("expected correlated AWS finding, got %+v", exp.AWS)
+	}
+	for _, want := range []model.RiskFlag{model.RiskAWSStaleKey, model.RiskAWSOverprivileged, model.RiskAWSExternalUsage} {
+		if !slices.Contains(exp.RiskFlags, want) {
+			t.Fatalf("missing AWS risk flag %s: %v", want, exp.RiskFlags)
+		}
 	}
 }

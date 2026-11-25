@@ -22,6 +22,10 @@ const (
 	RiskStaleSecret        RiskFlag = "stale_secret"
 	RiskUnreferencedSecret RiskFlag = "unreferenced_secret"
 	RiskUndefinedSecret    RiskFlag = "undefined_secret"
+	RiskAWSStaleKey        RiskFlag = "aws_stale_key"
+	RiskAWSZombieKey       RiskFlag = "aws_zombie_key"
+	RiskAWSOverprivileged  RiskFlag = "aws_overprivileged"
+	RiskAWSExternalUsage   RiskFlag = "aws_external_usage"
 )
 
 // StaleSecretAgeDays defines the default threshold after which a secret is flagged stale.
@@ -63,11 +67,17 @@ type WorkflowRef struct {
 
 // AWSFinding stores optional read-only AWS IAM metadata correlated with a secret.
 type AWSFinding struct {
-	IAMUser     string     `json:"iam_user,omitempty"`
-	AccessKeyID string     `json:"access_key_id,omitempty"`
-	AgeDays     int        `json:"age_days,omitempty"`
-	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
-	Flags       []string   `json:"flags,omitempty"`
+	IAMUser                string     `json:"iam_user,omitempty"`
+	AccessKeyID            string     `json:"access_key_id,omitempty"`
+	Status                 string     `json:"status,omitempty"`
+	AgeDays                int        `json:"age_days,omitempty"`
+	LastUsedAt             *time.Time `json:"last_used_at,omitempty"`
+	LastService            string     `json:"last_service,omitempty"`
+	OverprivilegedPolicies []string   `json:"overprivileged_policies,omitempty"`
+	GitHubRunnerSeen       bool       `json:"github_runner_seen,omitempty"`
+	ExternalUsageSeen      bool       `json:"external_usage_seen,omitempty"`
+	ExternalSources        []string   `json:"external_sources,omitempty"`
+	Flags                  []string   `json:"flags,omitempty"`
 }
 
 // SecretExposure aggregates all discovered definitions, workflow usages, and risks for one secret name.
@@ -108,6 +118,7 @@ type ScanReport struct {
 	GeneratedAt time.Time        `json:"generated_at"`
 	Summary     ScanSummary      `json:"summary"`
 	Exposures   []SecretExposure `json:"exposures"`
+	AWSKeys     []AWSFinding     `json:"aws_keys,omitempty"`
 	Warnings    []ScanWarning    `json:"warnings,omitempty"`
 }
 

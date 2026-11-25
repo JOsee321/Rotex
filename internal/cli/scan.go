@@ -52,10 +52,6 @@ func newScanCommand(deps Dependencies, noColor *bool) *cobra.Command {
 }
 
 func runScan(cmd *cobra.Command, deps Dependencies, opts *scanOptions, noColor *bool) error {
-	if opts.withAWS {
-		return errors.New("--with-aws correlation is not implemented yet")
-	}
-
 	format, err := output.ParseFormat(opts.format)
 	if err != nil {
 		return err
@@ -72,7 +68,17 @@ func runScan(cmd *cobra.Command, deps Dependencies, opts *scanOptions, noColor *
 	}
 
 	ghClient := deps.GitHubClientFactory(token, apiURL)
-	svc := scanner.NewService(ghClient, scanner.WithConcurrency(opts.concurrency))
+	scannerOpts := []scanner.Option{scanner.WithConcurrency(opts.concurrency)}
+
+	if opts.withAWS {
+		insp, awsErr := deps.AWSInspectorFactory(cmd.Context())
+		if awsErr != nil {
+			return awsErr
+		}
+		scannerOpts = append(scannerOpts, scanner.WithAWSInspector(insp))
+	}
+
+	svc := scanner.NewService(ghClient, scannerOpts...)
 
 	target := model.ScanTarget{
 		Org:             strings.TrimSpace(opts.org),

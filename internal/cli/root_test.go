@@ -8,10 +8,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JOsee321/Rotex/internal/aws"
 	"github.com/JOsee321/Rotex/internal/github"
 	"github.com/JOsee321/Rotex/internal/model"
 	"github.com/JOsee321/Rotex/internal/security"
 )
+
+type stubAWSInspector struct {
+	report *aws.AuditReport
+}
+
+func (s *stubAWSInspector) Inspect(_ context.Context, _ time.Duration) (*aws.AuditReport, error) {
+	return s.report, nil
+}
 
 type stubGitHubClient struct {
 	repo        github.Repository
@@ -145,5 +154,50 @@ func TestScanCommandExecutionJSONAndValidation(t *testing.T) {
 	noTokCmd.SetArgs([]string{"scan", "--repo", "octocat/hello"})
 	if err := noTokCmd.Execute(); err == nil || !strings.Contains(err.Error(), "GITHUB_TOKEN") {
 		t.Fatalf("expected missing token error, got: %v", err)
+	}
+}
+
+func TestScanCommandWithAWSFlag(t *testing.T) {
+	stub := &stubGitHubClient{
+		repo: github.Repository{Owner: "octocat", Name: "hello", FullName: "octocat/hello", DefaultBranch: "main"},
+		repoSecrets: []model.SecretMetadata{
+			{Name: "AWS_ACCESS_KEY_ID", Scope: model.ScopeRepo, Owner: "octocat", Repo: "octocat/hello", UpdatedAt: time.Now().UTC()},
+		},
+	}
+
+	deps := Dependencies{
+		LookupEnv: func(key string) string {
+			if key == "GITHUB_TOKEN" {
+				return "ghp_mock"
+			}
+			return ""
+		},
+		GitHubClientFactory: func(_ security.SensitiveString, _ string) github.Client { return stub },
+		AWSInspectorFactory: func(_ context.Context) (aws.Inspector, error) {
+			return &stubAWSInspector{
+				report: &aws.AuditReport{
+					Keys: []aws.AccessKeyAudit{
+						{UserName: "ci-bot", AccessKeyID: "AKIA_TEST", Status: "Active", AgeDays: 120, Stale: true},
+					},
+				},
+			}, nil
+		},
+	}
+
+	var out bytes.Buffer
+	cmd := NewRootCommandWithDeps(deps)
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"scan", "--repo", "octocat/hello", "--with-aws", "--format", "json"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("scan --with-aws failed: %v", err)
+	}
+	var report model.ScanReport
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(report.AWSKeys) != 1 || report.Exposures[0].AWS == nil {
+		t.Fatalf("expected AWS key correlation in report: %+v", report)
 	}
 }

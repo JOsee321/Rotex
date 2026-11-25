@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JOsee321/Rotex/internal/aws"
 	"github.com/JOsee321/Rotex/internal/github"
 	"github.com/JOsee321/Rotex/internal/model"
 	"github.com/JOsee321/Rotex/internal/workflow"
@@ -19,6 +20,7 @@ import (
 const (
 	defaultConcurrency = 5
 	maxConcurrency     = 16
+	defaultAWSLookback = 7 * 24 * time.Hour
 )
 
 // Option configures a Service instance.
@@ -55,9 +57,27 @@ func WithStaleDays(days int) Option {
 	}
 }
 
+// WithAWSInspector enables read-only AWS IAM and CloudTrail correlation.
+func WithAWSInspector(inspector aws.Inspector) Option {
+	return func(s *Service) {
+		s.aws = inspector
+	}
+}
+
+// WithAWSLookback sets the CloudTrail lookback duration when --with-aws is enabled.
+func WithAWSLookback(d time.Duration) Option {
+	return func(s *Service) {
+		if d > 0 {
+			s.awsLookback = d
+		}
+	}
+}
+
 // Service orchestrates read-only secret discovery and workflow exposure mapping.
 type Service struct {
 	gh          github.Client
+	aws         aws.Inspector
+	awsLookback time.Duration
 	now         func() time.Time
 	concurrency int
 	staleDays   int
@@ -67,6 +87,7 @@ type Service struct {
 func NewService(gh github.Client, opts ...Option) *Service {
 	s := &Service{
 		gh:          gh,
+		awsLookback: defaultAWSLookback,
 		now:         func() time.Time { return time.Now().UTC() },
 		concurrency: defaultConcurrency,
 		staleDays:   model.StaleSecretAgeDays,
@@ -158,7 +179,137 @@ func (s *Service) Scan(ctx context.Context, target model.ScanTarget) (*model.Sca
 	}
 
 	s.aggregate(report, orgSecrets, results, now)
+
+	if s.aws != nil {
+		if err := s.correlateAWS(ctx, report); err != nil {
+			return nil, err
+		}
+	}
+	report.Summary.WarningsCount = len(report.Warnings)
 	return report, nil
+}
+
+func (s *Service) correlateAWS(ctx context.Context, report *model.ScanReport) error {
+	audit, err := s.aws.Inspect(ctx, s.awsLookback)
+	if err != nil {
+		if aws.IsAccessDenied(err) {
+			report.Warnings = append(report.Warnings, model.ScanWarning{
+				Scope:   "aws",
+				Target:  "iam",
+				Code:    "permission_denied",
+				Message: fmt.Sprintf("unable to audit AWS IAM keys: %v", err),
+			})
+			return nil
+		}
+		return fmt.Errorf("audit AWS IAM metadata: %w", err)
+	}
+	for _, w := range audit.Warnings {
+		report.Warnings = append(report.Warnings, model.ScanWarning{
+			Scope:   "aws",
+			Target:  "iam",
+			Code:    "aws_warning",
+			Message: w,
+		})
+	}
+
+	findings := make([]model.AWSFinding, 0, len(audit.Keys))
+	for _, k := range audit.Keys {
+		findings = append(findings, toAWSFinding(k))
+	}
+	report.AWSKeys = findings
+
+	primary := selectPrimaryAWSFinding(findings)
+	if primary == nil {
+		return nil
+	}
+
+	report.Summary.RiskyExposures = 0
+	for i := range report.Exposures {
+		exp := &report.Exposures[i]
+		if isAWSSecretName(exp.SecretName) {
+			copyFinding := *primary
+			exp.AWS = &copyFinding
+			for _, f := range primary.Flags {
+				switch f {
+				case "stale_key":
+					exp.RiskFlags = appendUniqueRiskFlag(exp.RiskFlags, model.RiskAWSStaleKey)
+				case "zombie_key":
+					exp.RiskFlags = appendUniqueRiskFlag(exp.RiskFlags, model.RiskAWSZombieKey)
+				case "overprivileged":
+					exp.RiskFlags = appendUniqueRiskFlag(exp.RiskFlags, model.RiskAWSOverprivileged)
+				case "external_usage":
+					exp.RiskFlags = appendUniqueRiskFlag(exp.RiskFlags, model.RiskAWSExternalUsage)
+				}
+			}
+			sort.Slice(exp.RiskFlags, func(a, b int) bool { return exp.RiskFlags[a] < exp.RiskFlags[b] })
+		}
+		if len(exp.RiskFlags) > 0 {
+			report.Summary.RiskyExposures++
+		}
+	}
+	return nil
+}
+
+func toAWSFinding(k aws.AccessKeyAudit) model.AWSFinding {
+	var flags []string
+	if k.Stale {
+		flags = append(flags, "stale_key")
+	}
+	if k.Zombie {
+		flags = append(flags, "zombie_key")
+	}
+	if k.Overprivileged {
+		flags = append(flags, "overprivileged")
+	}
+	if k.ExternalUsageSeen {
+		flags = append(flags, "external_usage")
+	}
+	return model.AWSFinding{
+		IAMUser:                k.UserName,
+		AccessKeyID:            k.AccessKeyID,
+		Status:                 k.Status,
+		AgeDays:                k.AgeDays,
+		LastUsedAt:             k.LastUsedAt,
+		LastService:            k.LastUsedService,
+		OverprivilegedPolicies: slices.Clone(k.OverprivilegedPolicies),
+		GitHubRunnerSeen:       k.GitHubRunnerSeen,
+		ExternalUsageSeen:      k.ExternalUsageSeen,
+		ExternalSources:        slices.Clone(k.ExternalSources),
+		Flags:                  flags,
+	}
+}
+
+func selectPrimaryAWSFinding(findings []model.AWSFinding) *model.AWSFinding {
+	if len(findings) == 0 {
+		return nil
+	}
+	bestIdx := -1
+	bestScore := -1
+	for i, f := range findings {
+		score := 0
+		if strings.EqualFold(f.Status, "Active") {
+			score += 4
+		}
+		if f.GitHubRunnerSeen {
+			score += 8
+		}
+		if len(f.Flags) > 0 {
+			score += 2
+		}
+		if score > bestScore {
+			bestScore = score
+			bestIdx = i
+		}
+	}
+	if bestIdx < 0 {
+		return nil
+	}
+	return &findings[bestIdx]
+}
+
+func isAWSSecretName(name string) bool {
+	upper := strings.ToUpper(name)
+	return strings.HasPrefix(upper, "AWS_") || strings.Contains(upper, "AWS_ACCESS_KEY") || strings.Contains(upper, "AWS_SECRET")
 }
 
 func (s *Service) scanReposBounded(ctx context.Context, repos []github.Repository) ([]repoScanResult, error) {

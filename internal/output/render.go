@@ -110,6 +110,34 @@ func renderTable(w io.Writer, report *model.ScanReport, noColor bool) error {
 		}
 	}
 
+	if len(report.AWSKeys) > 0 {
+		if _, err := fmt.Fprintln(w, "\nAWS IAM Key Audit:"); err != nil {
+			return err
+		}
+		tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+		if _, err := fmt.Fprintln(tw, "IAM USER\tACCESS KEY ID\tSTATUS\tAGE (DAYS)\tLAST SERVICE\tGH RUNNER\tEXTERNAL\tFLAGS"); err != nil {
+			return err
+		}
+		for _, k := range report.AWSKeys {
+			flags := "none"
+			if len(k.Flags) > 0 {
+				flags = strings.Join(k.Flags, ",")
+			}
+			svcName := k.LastService
+			if svcName == "" {
+				svcName = "-"
+			}
+			if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%t\t%t\t%s\n",
+				k.IAMUser, k.AccessKeyID, k.Status, k.AgeDays, svcName, k.GitHubRunnerSeen, k.ExternalUsageSeen, flags,
+			); err != nil {
+				return err
+			}
+		}
+		if err := tw.Flush(); err != nil {
+			return err
+		}
+	}
+
 	if len(report.Warnings) > 0 {
 		if _, err := fmt.Fprintln(w, "\nWarnings:"); err != nil {
 			return err
@@ -158,6 +186,30 @@ func renderMarkdown(w io.Writer, report *model.ScanReport) error {
 				uniqueWorkflowCount(exp.WorkflowRefs),
 				formatAge(exp),
 				escapeMD(formatRiskFlags(exp.RiskFlags)),
+			); err != nil {
+				return err
+			}
+		}
+	}
+
+	if len(report.AWSKeys) > 0 {
+		if _, err := fmt.Fprintln(w, "\n### AWS IAM Key Audit\n\n| IAM User | Access Key ID | Status | Age (Days) | Last Service | GH Runner | External Usage | Flags |"); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintln(w, "| :--- | :--- | :--- | ---: | :--- | :---: | :---: | :--- |"); err != nil {
+			return err
+		}
+		for _, k := range report.AWSKeys {
+			flags := "none"
+			if len(k.Flags) > 0 {
+				flags = strings.Join(k.Flags, ",")
+			}
+			svcName := k.LastService
+			if svcName == "" {
+				svcName = "-"
+			}
+			if _, err := fmt.Fprintf(w, "| `%s` | `%s` | %s | %d | %s | %t | %t | %s |\n",
+				escapeMD(k.IAMUser), escapeMD(k.AccessKeyID), k.Status, k.AgeDays, escapeMD(svcName), k.GitHubRunnerSeen, k.ExternalUsageSeen, escapeMD(flags),
 			); err != nil {
 				return err
 			}

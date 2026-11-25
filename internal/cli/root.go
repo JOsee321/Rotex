@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"context"
 	"os"
 
+	"github.com/JOsee321/Rotex/internal/aws"
 	"github.com/JOsee321/Rotex/internal/github"
 	"github.com/JOsee321/Rotex/internal/security"
 	"github.com/spf13/cobra"
@@ -11,6 +13,7 @@ import (
 // Dependencies supplies external clients and environment readers for CLI commands.
 type Dependencies struct {
 	GitHubClientFactory func(token security.SensitiveString, apiURL string) github.Client
+	AWSInspectorFactory func(ctx context.Context) (aws.Inspector, error)
 	LookupEnv           func(key string) string
 }
 
@@ -22,6 +25,9 @@ func defaultDependencies() Dependencies {
 				opts = append(opts, github.WithBaseURL(apiURL))
 			}
 			return github.NewRESTClient(token, opts...)
+		},
+		AWSInspectorFactory: func(ctx context.Context) (aws.Inspector, error) {
+			return aws.NewDefaultInspector(ctx)
 		},
 		LookupEnv: os.Getenv,
 	}
@@ -39,6 +45,9 @@ func NewRootCommandWithDeps(deps Dependencies) *cobra.Command {
 	}
 	if deps.GitHubClientFactory == nil {
 		deps.GitHubClientFactory = defaultDependencies().GitHubClientFactory
+	}
+	if deps.AWSInspectorFactory == nil {
+		deps.AWSInspectorFactory = defaultDependencies().AWSInspectorFactory
 	}
 
 	var noColor bool
