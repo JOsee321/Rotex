@@ -22,8 +22,8 @@ Modern engineering teams store long-lived credentials (`AWS_ACCESS_KEY_ID`, `NPM
 
 - **Zero-Knowledge & Local-First:** Direct HTTPS calls from your local machine to GitHub and cloud provider APIs. No Rotex backend server exists.
 - **Read-Only by Default:** `rotex scan` and `rotex blast` only require read-only metadata scopes. Write operations require explicit `--apply` on `rotex rotate`.
-- **Safe Dual-Key State Machine:** New credentials are minted, encrypted locally with **Libsodium Sealed Box (`crypto_box_seal`)**, injected into GitHub Actions Secrets, and verified (e.g., via `sts:GetCallerIdentity`) *before* the old key is deactivated.
-- **Automatic Rollback & Memory Hygiene:** Mid-flight failures automatically delete newly minted unverified keys and leave the previous key active. Secret buffers are wrapped in redacted types (`[REDACTED]`) and zeroed in memory immediately after encryption.
+- **Safe Dual-Key State Machine:** New credentials are minted, verified (e.g., via `sts:GetCallerIdentity`), encrypted locally with **Libsodium Sealed Box (`crypto_box_seal`)**, and injected into GitHub Actions Secrets *before* the old key is deactivated.
+- **Automatic Rollback & Memory Hygiene:** Pre-injection verification/setup failures automatically delete newly minted uninjected keys, while partial-injection failures preserve both active keys to prevent downtime. Secret buffers are wrapped in redacted types (`[REDACTED]`) and zeroed in memory immediately after encryption.
 
 ---
 

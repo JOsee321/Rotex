@@ -358,7 +358,7 @@ func TestRotexCLIEndToEnd(t *testing.T) {
 		t.Fatalf("expected REVOKED after cleanup, got: %+v", cleaned)
 	}
 
-	// 6. Mid-flight injection failure triggers automatic rollback.
+	// 6. Mid-flight partial injection failure preserves BOTH old and new active keys to avoid breaking updated repos.
 	backend.mu.Lock()
 	backend.iamKeys = []mockIAMKey{{id: "AKIA_OLD_ACTIVE", status: "Active"}}
 	backend.failPutRepo = "acme/web"
@@ -372,12 +372,44 @@ func TestRotexCLIEndToEnd(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected rotate --apply to fail when acme/web returns HTTP 500")
 	}
+	var partialState rotate.RunState
+	if err := json.Unmarshal([]byte(stdout), &partialState); err != nil {
+		t.Fatalf("decode failed state JSON: %v\n%s", err, stdout)
+	}
+	if partialState.Stage != rotate.StageFailedRecoverable || partialState.NewDeleted || partialState.OldDeactivated {
+		t.Fatalf("expected partial failure to keep both keys active in FAILED_RECOVERABLE, got: %+v", partialState)
+	}
+	if len(backend.deactivatedKeys) != 0 || len(backend.deletedKeys) != 0 {
+		t.Fatalf("neither key must be deactivated or deleted after partial injection: deactivated=%v deleted=%v", backend.deactivatedKeys, backend.deletedKeys)
+	}
+
+	// Clean up minted key before testing 2-key guard cleanly.
+	_, _, err = runCLI(t, binPath, srv.URL, nil,
+		"rollback", "--run-id", partialState.RunID, "--state-dir", stateDir, "--format", "json")
+	if err != nil {
+		t.Fatalf("cleanup rollback after partial failure failed: %v", err)
+	}
+
+	// 6b. Pre-mutation injection failure (first target fails) triggers automatic rollback deleting NewKeyID.
+	backend.mu.Lock()
+	backend.iamKeys = []mockIAMKey{{id: "AKIA_OLD_ACTIVE", status: "Active"}}
+	backend.failPutRepo = "acme/api"
+	backend.deactivatedKeys = nil
+	backend.deletedKeys = nil
+	backend.mu.Unlock()
+
+	stdout, _, err = runCLI(t, binPath, srv.URL, nil,
+		"rotate", "--iam-user", "ci-deployer", "--repo", "acme/api", "--repo", "acme/web",
+		"--apply", "--state-dir", stateDir, "--verify-timeout", "2s", "--verify-backoff", "10ms", "--format", "json")
+	if err == nil {
+		t.Fatalf("expected rotate --apply to fail when first repo acme/api returns HTTP 500")
+	}
 	var rolledState rotate.RunState
 	if err := json.Unmarshal([]byte(stdout), &rolledState); err != nil {
 		t.Fatalf("decode failed state JSON: %v\n%s", err, stdout)
 	}
 	if rolledState.Stage != rotate.StageRolledBack || !rolledState.NewDeleted {
-		t.Fatalf("expected automatic rollback to ROLLED_BACK, got: %+v", rolledState)
+		t.Fatalf("expected automatic rollback to ROLLED_BACK when 0 secrets were mutated, got: %+v", rolledState)
 	}
 	if len(backend.deactivatedKeys) != 0 {
 		t.Fatalf("old key must not be deactivated on failed injection: %v", backend.deactivatedKeys)

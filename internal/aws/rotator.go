@@ -7,19 +7,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JOsee321/Rotex/internal/rotate"
+	"github.com/JOsee321/Rotex/internal/security"
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/JOsee321/Rotex/internal/rotate"
-	"github.com/JOsee321/Rotex/internal/security"
 )
 
 const (
-	maxIAMKeysPerUser    = 2
-	defaultVerifyTimeout = 30 * time.Second
+	maxIAMKeysPerUser     = 2
+	maxIAMKeyPages        = 20
+	defaultVerifyTimeout  = 30 * time.Second
 	defaultInitialBackoff = 1 * time.Second
 )
 
@@ -144,33 +145,44 @@ func (r *SDKRotator) PreflightCheck(ctx context.Context, target rotate.KeyTarget
 	if strings.TrimSpace(target.IAMUser) == "" {
 		return nil, errors.New("IAM user name is required")
 	}
-	out, err := r.iam.ListAccessKeys(ctx, &iam.ListAccessKeysInput{
-		UserName: awssdk.String(target.IAMUser),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("list access keys for IAM user %s: %w", target.IAMUser, err)
+
+	var keys []iamtypes.AccessKeyMetadata
+	var marker *string
+	for page := 0; page < maxIAMKeyPages; page++ {
+		out, err := r.iam.ListAccessKeys(ctx, &iam.ListAccessKeysInput{
+			UserName: awssdk.String(target.IAMUser),
+			Marker:   marker,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list access keys for IAM user %s: %w", target.IAMUser, err)
+		}
+		keys = append(keys, out.AccessKeyMetadata...)
+		if !out.IsTruncated || out.Marker == nil {
+			break
+		}
+		marker = out.Marker
 	}
 
-	existingIDs := make([]string, 0, len(out.AccessKeyMetadata))
-	for _, k := range out.AccessKeyMetadata {
+	existingIDs := make([]string, 0, len(keys))
+	for _, k := range keys {
 		existingIDs = append(existingIDs, fmt.Sprintf("%s (%s)", awssdk.ToString(k.AccessKeyId), k.Status))
 	}
 
-	if len(out.AccessKeyMetadata) >= maxIAMKeysPerUser {
+	if len(keys) >= maxIAMKeysPerUser {
 		return nil, fmt.Errorf(
 			"IAM user %q already has %d/%d access keys (%s); delete an unused key before rotating",
-			target.IAMUser, len(out.AccessKeyMetadata), maxIAMKeysPerUser, strings.Join(existingIDs, ", "),
+			target.IAMUser, len(keys), maxIAMKeysPerUser, strings.Join(existingIDs, ", "),
 		)
 	}
 
 	resolvedOld := strings.TrimSpace(target.OldKeyID)
 	if resolvedOld == "" {
-		if len(out.AccessKeyMetadata) == 1 {
-			resolvedOld = awssdk.ToString(out.AccessKeyMetadata[0].AccessKeyId)
+		if len(keys) == 1 {
+			resolvedOld = awssdk.ToString(keys[0].AccessKeyId)
 		}
 	} else {
 		found := false
-		for _, k := range out.AccessKeyMetadata {
+		for _, k := range keys {
 			if awssdk.ToString(k.AccessKeyId) == resolvedOld {
 				found = true
 				break
@@ -183,7 +195,7 @@ func (r *SDKRotator) PreflightCheck(ctx context.Context, target rotate.KeyTarget
 
 	return &rotate.PreflightInfo{
 		ResolvedOldKeyID: resolvedOld,
-		ExistingKeyCount: len(out.AccessKeyMetadata),
+		ExistingKeyCount: len(keys),
 		ExistingKeyIDs:   existingIDs,
 	}, nil
 }
@@ -228,8 +240,16 @@ func (r *SDKRotator) VerifyKey(ctx context.Context, mat *rotate.SecretMaterial) 
 		return errors.New("missing AWS_SECRET_ACCESS_KEY in secret material")
 	}
 
-	deadline := time.Now().Add(r.verifyTimeout)
+	timeout := r.verifyTimeout
+	if timeout <= 0 {
+		timeout = defaultVerifyTimeout
+	}
 	backoff := r.initialBackoff
+	if backoff <= 0 {
+		backoff = defaultInitialBackoff
+	}
+
+	deadline := time.Now().Add(timeout)
 	var lastErr error
 
 	for {
@@ -239,14 +259,12 @@ func (r *SDKRotator) VerifyKey(ctx context.Context, mat *rotate.SecretMaterial) 
 			lastErr = err
 		}
 
-		if time.Now().After(deadline) || ctx.Err() != nil {
+		remaining := time.Until(deadline)
+		if remaining <= 0 || ctx.Err() != nil {
 			break
 		}
 
-		sleep := min(backoff, time.Until(deadline))
-		if sleep <= 0 {
-			break
-		}
+		sleep := min(backoff, remaining)
 		timer := time.NewTimer(sleep)
 		select {
 		case <-ctx.Done():
@@ -254,7 +272,11 @@ func (r *SDKRotator) VerifyKey(ctx context.Context, mat *rotate.SecretMaterial) 
 			return ctx.Err()
 		case <-timer.C:
 		}
-		backoff *= 2
+		if backoff > remaining/2 {
+			backoff = remaining
+		} else {
+			backoff *= 2
+		}
 	}
 
 	return fmt.Errorf("verify minted AWS key %s via STS failed: %w", mat.KeyID, lastErr)
@@ -262,6 +284,9 @@ func (r *SDKRotator) VerifyKey(ctx context.Context, mat *rotate.SecretMaterial) 
 
 // DeactivateKey sets keyID status to Inactive without deleting it.
 func (r *SDKRotator) DeactivateKey(ctx context.Context, target rotate.KeyTarget, keyID string) error {
+	if strings.TrimSpace(target.IAMUser) == "" || strings.TrimSpace(keyID) == "" {
+		return errors.New("IAM user and access key ID are required to deactivate key")
+	}
 	_, err := r.iam.UpdateAccessKey(ctx, &iam.UpdateAccessKeyInput{
 		UserName:    awssdk.String(target.IAMUser),
 		AccessKeyId: awssdk.String(keyID),
@@ -275,6 +300,9 @@ func (r *SDKRotator) DeactivateKey(ctx context.Context, target rotate.KeyTarget,
 
 // ReactivateKey restores an Inactive access key back to Active status.
 func (r *SDKRotator) ReactivateKey(ctx context.Context, target rotate.KeyTarget, keyID string) error {
+	if strings.TrimSpace(target.IAMUser) == "" || strings.TrimSpace(keyID) == "" {
+		return errors.New("IAM user and access key ID are required to reactivate key")
+	}
 	_, err := r.iam.UpdateAccessKey(ctx, &iam.UpdateAccessKeyInput{
 		UserName:    awssdk.String(target.IAMUser),
 		AccessKeyId: awssdk.String(keyID),
@@ -288,6 +316,9 @@ func (r *SDKRotator) ReactivateKey(ctx context.Context, target rotate.KeyTarget,
 
 // DeleteKey permanently deletes an IAM access key.
 func (r *SDKRotator) DeleteKey(ctx context.Context, target rotate.KeyTarget, keyID string) error {
+	if strings.TrimSpace(target.IAMUser) == "" || strings.TrimSpace(keyID) == "" {
+		return errors.New("IAM user and access key ID are required to delete key")
+	}
 	_, err := r.iam.DeleteAccessKey(ctx, &iam.DeleteAccessKeyInput{
 		UserName:    awssdk.String(target.IAMUser),
 		AccessKeyId: awssdk.String(keyID),

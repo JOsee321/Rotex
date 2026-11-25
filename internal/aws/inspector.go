@@ -280,18 +280,28 @@ func (s *SDKInspector) inspectUserPrivileges(ctx context.Context, userName strin
 		attachedMarker = attached.Marker
 	}
 
-	inlineOut, err := s.iam.ListUserPolicies(ctx, &iam.ListUserPoliciesInput{
-		UserName: awssdk.String(userName),
-	})
-	if err != nil {
-		if IsAccessDenied(err) {
-			warnings = append(warnings, fmt.Sprintf("AWS iam:ListUserPolicies denied for user %s", userName))
-			return flagged, warnings, nil
+	var inlineNames []string
+	var inlineMarker *string
+	for {
+		inlineOut, err := s.iam.ListUserPolicies(ctx, &iam.ListUserPoliciesInput{
+			UserName: awssdk.String(userName),
+			Marker:   inlineMarker,
+		})
+		if err != nil {
+			if IsAccessDenied(err) {
+				warnings = append(warnings, fmt.Sprintf("AWS iam:ListUserPolicies denied for user %s", userName))
+				return flagged, warnings, nil
+			}
+			return nil, nil, fmt.Errorf("list inline policies for %s: %w", userName, err)
 		}
-		return nil, nil, fmt.Errorf("list inline policies for %s: %w", userName, err)
+		inlineNames = append(inlineNames, inlineOut.PolicyNames...)
+		if !inlineOut.IsTruncated || inlineOut.Marker == nil {
+			break
+		}
+		inlineMarker = inlineOut.Marker
 	}
 
-	for _, policyName := range inlineOut.PolicyNames {
+	for _, policyName := range inlineNames {
 		docOut, docErr := s.iam.GetUserPolicy(ctx, &iam.GetUserPolicyInput{
 			UserName:   awssdk.String(userName),
 			PolicyName: awssdk.String(policyName),

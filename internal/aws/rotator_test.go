@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JOsee321/Rotex/internal/rotate"
+	"github.com/JOsee321/Rotex/internal/security"
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
-	"github.com/JOsee321/Rotex/internal/rotate"
-	"github.com/JOsee321/Rotex/internal/security"
 )
 
 type mockIAMWriteClient struct {
@@ -118,5 +118,11 @@ func TestSDKRotatorMintVerifyBackoffAndLifecycle(t *testing.T) {
 	}
 	if err := rotator.DeleteKey(context.Background(), target, "AKIA_OLD"); err != nil || len(iamMock.deletedKeys) != 1 {
 		t.Fatalf("DeleteKey failed: %v", err)
+	}
+	if err := rotator.DeactivateKey(context.Background(), target, ""); err == nil {
+		t.Fatalf("expected error on empty keyID in DeactivateKey")
+	}
+	if err := rotator.DeleteKey(context.Background(), rotate.KeyTarget{}, "AKIA_OLD"); err == nil {
+		t.Fatalf("expected error on empty IAMUser in DeleteKey")
 	}
 }
