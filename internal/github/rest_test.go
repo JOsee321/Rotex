@@ -1,6 +1,7 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -260,4 +261,119 @@ func mustTime(t *testing.T, raw string) time.Time {
 		t.Fatalf("time.Parse failed: %v", err)
 	}
 	return ts
+}
+
+func TestRESTClientRejectsCrossOriginPaginationLinkAndRedirects(t *testing.T) {
+	const token = "ghp_super_secret_redirect_token"
+	var attackerCalled atomic.Bool
+
+	rt := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Host {
+		case "attacker.example":
+			attackerCalled.Store(true)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("[]"))
+		case "api.example.com", "sub.api.example.com":
+			if r.URL.Host == "sub.api.example.com" {
+				attackerCalled.Store(true)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			switch r.URL.Path {
+			case "/orgs/evil-link/repos":
+				w.Header().Set("Link", `<https://attacker.example/steal>; rel="next"`)
+				_ = json.NewEncoder(w).Encode([]map[string]any{{"name": "a", "full_name": "evil-link/a"}})
+			case "/orgs/loop/repos":
+				w.Header().Set("Link", `<https://api.example.com/orgs/loop/repos?per_page=100&type=all>; rel="next"`)
+				_ = json.NewEncoder(w).Encode([]map[string]any{})
+			case "/repos/acme/redirect-sub":
+				w.Header().Set("Location", "https://sub.api.example.com/steal")
+				w.WriteHeader(http.StatusFound)
+			case "/repos/acme/redirect-downgrade":
+				w.Header().Set("Location", "http://api.example.com/downgraded")
+				w.WriteHeader(http.StatusMovedPermanently)
+			case "/repos/acme/echo-token":
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]string{"message": "bad token " + token})
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	client := NewRESTClient(
+		security.NewSensitiveString(token),
+		WithBaseURL("https://api.example.com"),
+		WithHTTPClient(&http.Client{Transport: handlerRoundTripper{handler: rt}}),
+	)
+	ctx := context.Background()
+
+	if _, err := client.ListOrgRepos(ctx, "evil-link"); err == nil {
+		t.Fatalf("expected cross-origin Link rel=next to fail")
+	}
+	if attackerCalled.Load() {
+		t.Fatalf("client sent request (and Authorization header) to cross-origin host!")
+	}
+
+	if _, err := client.ListOrgRepos(ctx, "loop"); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("expected pagination cycle error, got %v", err)
+	}
+
+	if _, err := client.GetRepo(ctx, "acme", "redirect-sub"); err == nil {
+		t.Fatalf("expected cross-origin subdomain redirect to be refused")
+	}
+	if attackerCalled.Load() {
+		t.Fatalf("redirect reached subdomain host!")
+	}
+
+	if _, err := client.GetRepo(ctx, "acme", "redirect-downgrade"); err == nil {
+		t.Fatalf("expected HTTPS->HTTP redirect downgrade to be refused")
+	}
+
+	_, err := client.GetRepo(ctx, "acme", "echo-token")
+	if err == nil || !IsUnauthorized(err) {
+		t.Fatalf("expected unauthorized APIError, got %v", err)
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("APIError leaked token: %v", err)
+	}
+}
+
+func TestRESTClientRejectsPathTraversalAndOversizedResponse(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/acme/api/git/trees/main":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tree": []map[string]any{
+					{"path": "../../../orgs/victim/actions/secrets/package-lock.json", "type": "blob"},
+				},
+			})
+		case "/repos/acme/huge/actions/secrets":
+			// Exceed 16 MiB response cap without allocating a huge slice in one shot.
+			chunk := bytes.Repeat([]byte("A"), 1<<20)
+			for range 17 {
+				_, _ = w.Write(chunk)
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	client := newMockRESTClient("tok", handler)
+	ctx := context.Background()
+
+	if _, err := client.GetRepo(ctx, "acme", ".."); err == nil {
+		t.Fatalf("expected path traversal dot-segment repo to be rejected")
+	}
+	if _, err := client.ListEnvironmentSecrets(ctx, "acme", "api", "../other"); err == nil {
+		t.Fatalf("expected path traversal env to be rejected")
+	}
+	if _, err := client.ListRepoLockfiles(ctx, "acme", "api", "main"); err == nil {
+		t.Fatalf("expected traversal path in git tree to be rejected")
+	}
+	if _, err := client.ListRepoSecrets(ctx, "acme", "huge"); err == nil || !strings.Contains(err.Error(), "exceeded maximum") {
+		t.Fatalf("expected oversized response error, got %v", err)
+	}
 }

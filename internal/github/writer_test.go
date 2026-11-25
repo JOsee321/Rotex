@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/JOsee321/Rotex/internal/model"
@@ -72,5 +73,55 @@ func TestSecretStoreUpdateSecretSealedBox(t *testing.T) {
 	plain, ok := box.OpenAnonymous(nil, cipherBytes, pubKey, privKey)
 	if !ok || string(plain) != "super-secret-aws-value" {
 		t.Fatalf("failed to decrypt sealed secret: ok=%v, plain=%q", ok, string(plain))
+	}
+}
+
+func TestSecretStoreRejectsPathInjectionAndSanitizesErrors(t *testing.T) {
+	pubKey, _, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("box.GenerateKey failed: %v", err)
+	}
+	pubB64 := base64.StdEncoding.EncodeToString(pubKey[:])
+
+	const token = "ghp_writer_secret_pat_123"
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/acme/api/actions/secrets/public-key" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"key_id": "k1", "key": pubB64})
+			return
+		}
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"message": "boom with " + token})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	store := NewSecretStore(newMockRESTClient(token, handler))
+	ctx := context.Background()
+	val := security.NewSensitiveBytes([]byte("secret-val"))
+	defer val.Wipe()
+
+	for _, badScope := range []rotate.StoreScope{
+		{Scope: model.ScopeOrg, Org: ""},
+		{Scope: model.ScopeOrg, Org: ".."},
+		{Scope: model.ScopeRepo, Repo: "acme/.."},
+		{Scope: model.ScopeRepo, Repo: "acme/api/extra"},
+		{Scope: model.ScopeEnvironment, Repo: "acme/api", Environment: ".."},
+	} {
+		if err := store.UpdateSecret(ctx, badScope, "MY_SECRET", val); err == nil {
+			t.Fatalf("expected invalid scope %+v to fail", badScope)
+		}
+	}
+
+	for _, badName := range []string{"", ".", "..", "A/B", "A?x=1", "BAD NAME"} {
+		if err := store.UpdateSecret(ctx, rotate.StoreScope{Scope: model.ScopeRepo, Repo: "acme/api"}, badName, val); err == nil {
+			t.Fatalf("expected invalid secret name %q to fail", badName)
+		}
+	}
+
+	err = store.UpdateSecret(ctx, rotate.StoreScope{Scope: model.ScopeRepo, Repo: "acme/api"}, "MY_SECRET", val)
+	if err == nil || strings.Contains(err.Error(), token) {
+		t.Fatalf("expected sanitized error without token, got %v", err)
 	}
 }

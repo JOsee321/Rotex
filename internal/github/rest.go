@@ -1,9 +1,11 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/JOsee321/Rotex/internal/lockfile"
 	"github.com/JOsee321/Rotex/internal/model"
@@ -21,9 +24,15 @@ import (
 )
 
 const (
-	defaultBaseURL    = "https://api.github.com"
-	defaultAPIVersion = "2022-11-28"
-	defaultUserAgent  = "rotex-cli"
+	defaultBaseURL        = "https://api.github.com"
+	defaultAPIVersion     = "2022-11-28"
+	defaultUserAgent      = "rotex-cli"
+	maxAPIResponseBytes   = 16 << 20 // 16 MiB
+	maxWriteResponseBytes = 1 << 20  // 1 MiB
+	maxCacheEntries       = 256
+	maxCacheEntryBytes    = 1 << 20 // 1 MiB
+	maxPaginationPages    = 500
+	maxHTTPRedirects      = 10
 )
 
 var nextLinkRe = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
@@ -36,6 +45,8 @@ type cachedResponse struct {
 // RESTClient implements Client against the GitHub REST API with ETag caching.
 type RESTClient struct {
 	baseURL    string
+	parsedBase *url.URL
+	baseErr    error
 	httpClient *http.Client
 	token      security.SensitiveString
 	userAgent  string
@@ -60,7 +71,8 @@ func WithBaseURL(rawURL string) Option {
 func WithHTTPClient(client *http.Client) Option {
 	return func(c *RESTClient) {
 		if client != nil {
-			c.httpClient = client
+			cloned := *client
+			c.httpClient = &cloned
 		}
 	}
 }
@@ -88,7 +100,55 @@ func NewRESTClient(token security.SensitiveString, opts ...Option) *RESTClient {
 			opt(c)
 		}
 	}
+	c.parsedBase, c.baseErr = parseAndValidateBaseURL(c.baseURL)
+	if c.parsedBase != nil {
+		c.installRedirectGuard()
+	}
 	return c
+}
+
+func parseAndValidateBaseURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid GitHub API base URL: %w", err)
+	}
+	if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return nil, fmt.Errorf("invalid GitHub API base URL %q: scheme and host are required", raw)
+	}
+	if u.User != nil {
+		return nil, errors.New("GitHub API base URL must not contain embedded credentials")
+	}
+	return u, nil
+}
+
+func (c *RESTClient) installRedirectGuard() {
+	cloned := *c.httpClient
+	userCheck := cloned.CheckRedirect
+	base := c.parsedBase
+
+	cloned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= maxHTTPRedirects {
+			req.Header.Del("Authorization")
+			return fmt.Errorf("stopped after %d redirects", maxHTTPRedirects)
+		}
+		if len(via) > 0 && strings.EqualFold(via[0].URL.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
+			req.Header.Del("Authorization")
+			return errors.New("refusing insecure HTTP redirect downgrade from HTTPS")
+		}
+		if len(via) > 0 && via[0].Method == http.MethodPut {
+			req.Header.Del("Authorization")
+			return errors.New("refusing HTTP redirect on write request")
+		}
+		if !sameOrigin(req.URL, base) || req.URL.User != nil {
+			req.Header.Del("Authorization")
+			return fmt.Errorf("refusing cross-origin HTTP redirect to %s://%s", req.URL.Scheme, req.URL.Host)
+		}
+		if userCheck != nil {
+			return userCheck(req, via)
+		}
+		return nil
+	}
+	c.httpClient = &cloned
 }
 
 type apiRepo struct {
@@ -145,28 +205,36 @@ type apiContentItem struct {
 
 // ListOrgRepos lists all repositories belonging to org across paginated responses.
 func (c *RESTClient) ListOrgRepos(ctx context.Context, org string) ([]Repository, error) {
+	if err := validatePathSegment("org", org, false); err != nil {
+		return nil, err
+	}
 	endpoint := fmt.Sprintf("/orgs/%s/repos?per_page=100&type=all", url.PathEscape(org))
 	var repos []Repository
 
-	for endpoint != "" {
-		body, next, err := c.get(ctx, endpoint, "application/vnd.github+json")
-		if err != nil {
-			return nil, err
-		}
+	err := c.getPaginated(ctx, endpoint, "application/vnd.github+json", func(body []byte) error {
 		var page []apiRepo
 		if err := json.Unmarshal(body, &page); err != nil {
-			return nil, fmt.Errorf("decode org repos: %w", err)
+			return fmt.Errorf("decode org repos: %w", err)
 		}
 		for _, item := range page {
 			repos = append(repos, item.toModel())
 		}
-		endpoint = next
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return repos, nil
 }
 
 // GetRepo fetches metadata for a single owner/name repository.
 func (c *RESTClient) GetRepo(ctx context.Context, owner, name string) (Repository, error) {
+	if err := validatePathSegment("owner", owner, false); err != nil {
+		return Repository{}, err
+	}
+	if err := validatePathSegment("repo", name, false); err != nil {
+		return Repository{}, err
+	}
 	endpoint := fmt.Sprintf("/repos/%s/%s", url.PathEscape(owner), url.PathEscape(name))
 	body, _, err := c.get(ctx, endpoint, "application/vnd.github+json")
 	if err != nil {
@@ -181,17 +249,16 @@ func (c *RESTClient) GetRepo(ctx context.Context, owner, name string) (Repositor
 
 // ListOrgSecrets lists organization-level Actions secret metadata.
 func (c *RESTClient) ListOrgSecrets(ctx context.Context, org string) ([]model.SecretMetadata, error) {
+	if err := validatePathSegment("org", org, false); err != nil {
+		return nil, err
+	}
 	endpoint := fmt.Sprintf("/orgs/%s/actions/secrets?per_page=100", url.PathEscape(org))
 	var out []model.SecretMetadata
 
-	for endpoint != "" {
-		body, next, err := c.get(ctx, endpoint, "application/vnd.github+json")
-		if err != nil {
-			return nil, err
-		}
+	err := c.getPaginated(ctx, endpoint, "application/vnd.github+json", func(body []byte) error {
 		var resp apiSecretsResponse
 		if err := json.Unmarshal(body, &resp); err != nil {
-			return nil, fmt.Errorf("decode org secrets: %w", err)
+			return fmt.Errorf("decode org secrets: %w", err)
 		}
 		for _, s := range resp.Secrets {
 			out = append(out, model.SecretMetadata{
@@ -203,24 +270,29 @@ func (c *RESTClient) ListOrgSecrets(ctx context.Context, org string) ([]model.Se
 				UpdatedAt:  s.UpdatedAt,
 			})
 		}
-		endpoint = next
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
 // ListRepoSecrets lists repository-level Actions secret metadata.
 func (c *RESTClient) ListRepoSecrets(ctx context.Context, owner, repo string) ([]model.SecretMetadata, error) {
+	if err := validatePathSegment("owner", owner, false); err != nil {
+		return nil, err
+	}
+	if err := validatePathSegment("repo", repo, false); err != nil {
+		return nil, err
+	}
 	endpoint := fmt.Sprintf("/repos/%s/%s/actions/secrets?per_page=100", url.PathEscape(owner), url.PathEscape(repo))
 	var out []model.SecretMetadata
 
-	for endpoint != "" {
-		body, next, err := c.get(ctx, endpoint, "application/vnd.github+json")
-		if err != nil {
-			return nil, err
-		}
+	err := c.getPaginated(ctx, endpoint, "application/vnd.github+json", func(body []byte) error {
 		var resp apiSecretsResponse
 		if err := json.Unmarshal(body, &resp); err != nil {
-			return nil, fmt.Errorf("decode repo secrets: %w", err)
+			return fmt.Errorf("decode repo secrets: %w", err)
 		}
 		for _, s := range resp.Secrets {
 			out = append(out, model.SecretMetadata{
@@ -232,49 +304,62 @@ func (c *RESTClient) ListRepoSecrets(ctx context.Context, owner, repo string) ([
 				UpdatedAt: s.UpdatedAt,
 			})
 		}
-		endpoint = next
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
 // ListEnvironments lists deployment environments configured on owner/repo.
 func (c *RESTClient) ListEnvironments(ctx context.Context, owner, repo string) ([]Environment, error) {
+	if err := validatePathSegment("owner", owner, false); err != nil {
+		return nil, err
+	}
+	if err := validatePathSegment("repo", repo, false); err != nil {
+		return nil, err
+	}
 	endpoint := fmt.Sprintf("/repos/%s/%s/environments?per_page=100", url.PathEscape(owner), url.PathEscape(repo))
 	var out []Environment
 
-	for endpoint != "" {
-		body, next, err := c.get(ctx, endpoint, "application/vnd.github+json")
-		if err != nil {
-			return nil, err
-		}
+	err := c.getPaginated(ctx, endpoint, "application/vnd.github+json", func(body []byte) error {
 		var resp apiEnvironmentsResponse
 		if err := json.Unmarshal(body, &resp); err != nil {
-			return nil, fmt.Errorf("decode environments: %w", err)
+			return fmt.Errorf("decode environments: %w", err)
 		}
 		for _, env := range resp.Environments {
 			if env.Name != "" {
 				out = append(out, Environment{Name: env.Name})
 			}
 		}
-		endpoint = next
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
 // ListEnvironmentSecrets lists Actions secret metadata scoped to a repository environment.
 func (c *RESTClient) ListEnvironmentSecrets(ctx context.Context, owner, repo, env string) ([]model.SecretMetadata, error) {
+	if err := validatePathSegment("owner", owner, false); err != nil {
+		return nil, err
+	}
+	if err := validatePathSegment("repo", repo, false); err != nil {
+		return nil, err
+	}
+	if err := validatePathSegment("environment", env, true); err != nil {
+		return nil, err
+	}
 	endpoint := fmt.Sprintf("/repos/%s/%s/environments/%s/secrets?per_page=100",
 		url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(env))
 	var out []model.SecretMetadata
 
-	for endpoint != "" {
-		body, next, err := c.get(ctx, endpoint, "application/vnd.github+json")
-		if err != nil {
-			return nil, err
-		}
+	err := c.getPaginated(ctx, endpoint, "application/vnd.github+json", func(body []byte) error {
 		var resp apiSecretsResponse
 		if err := json.Unmarshal(body, &resp); err != nil {
-			return nil, fmt.Errorf("decode environment secrets: %w", err)
+			return fmt.Errorf("decode environment secrets: %w", err)
 		}
 		for _, s := range resp.Secrets {
 			out = append(out, model.SecretMetadata{
@@ -287,13 +372,25 @@ func (c *RESTClient) ListEnvironmentSecrets(ctx context.Context, owner, repo, en
 				UpdatedAt:   s.UpdatedAt,
 			})
 		}
-		endpoint = next
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
 // ListWorkflowFiles fetches YAML workflow definitions under .github/workflows/ for owner/repo.
 func (c *RESTClient) ListWorkflowFiles(ctx context.Context, owner, repo, ref string) ([]WorkflowFile, error) {
+	if err := validatePathSegment("owner", owner, false); err != nil {
+		return nil, err
+	}
+	if err := validatePathSegment("repo", repo, false); err != nil {
+		return nil, err
+	}
+	if err := validateRef(ref); err != nil {
+		return nil, err
+	}
 	endpoint := fmt.Sprintf("/repos/%s/%s/contents/.github/workflows", url.PathEscape(owner), url.PathEscape(repo))
 	if strings.TrimSpace(ref) != "" {
 		endpoint += "?ref=" + url.QueryEscape(ref)
@@ -331,8 +428,16 @@ func (c *RESTClient) ListWorkflowFiles(ctx context.Context, owner, repo, ref str
 
 // ListRepoLockfiles discovers and fetches supported dependency lockfiles in owner/repo.
 func (c *RESTClient) ListRepoLockfiles(ctx context.Context, owner, repo, ref string) ([]RepoFile, error) {
+	if err := validatePathSegment("owner", owner, false); err != nil {
+		return nil, err
+	}
+	if err := validatePathSegment("repo", repo, false); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(ref) == "" {
 		ref = "HEAD"
+	} else if err := validateRef(ref); err != nil {
+		return nil, err
 	}
 	treeEndpoint := fmt.Sprintf("/repos/%s/%s/git/trees/%s?recursive=1",
 		url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(ref))
@@ -394,20 +499,19 @@ func (c *RESTClient) ListRepoLockfiles(ctx context.Context, owner, repo, ref str
 
 // ListWorkflowRuns lists workflow runs in owner/repo created at or after since.
 func (c *RESTClient) ListWorkflowRuns(ctx context.Context, owner, repo string, since time.Time) ([]WorkflowRun, error) {
+	if err := validatePathSegment("owner", owner, false); err != nil {
+		return nil, err
+	}
+	if err := validatePathSegment("repo", repo, false); err != nil {
+		return nil, err
+	}
 	endpoint := fmt.Sprintf("/repos/%s/%s/actions/runs?per_page=100", url.PathEscape(owner), url.PathEscape(repo))
 	if !since.IsZero() {
 		endpoint += "&created=" + url.QueryEscape(">="+since.UTC().Format(time.RFC3339))
 	}
 
 	var runs []WorkflowRun
-	for endpoint != "" {
-		body, next, err := c.get(ctx, endpoint, "application/vnd.github+json")
-		if err != nil {
-			if IsNotFound(err) {
-				return nil, nil
-			}
-			return nil, err
-		}
+	err := c.getPaginated(ctx, endpoint, "application/vnd.github+json", func(body []byte) error {
 		var resp struct {
 			WorkflowRuns []struct {
 				ID         int64     `json:"id"`
@@ -420,7 +524,7 @@ func (c *RESTClient) ListWorkflowRuns(ctx context.Context, owner, repo string, s
 			} `json:"workflow_runs"`
 		}
 		if err := json.Unmarshal(body, &resp); err != nil {
-			return nil, fmt.Errorf("decode workflow runs: %w", err)
+			return fmt.Errorf("decode workflow runs: %w", err)
 		}
 		for _, r := range resp.WorkflowRuns {
 			if !since.IsZero() && r.CreatedAt.Before(since) {
@@ -436,13 +540,25 @@ func (c *RESTClient) ListWorkflowRuns(ctx context.Context, owner, repo string, s
 				CreatedAt:  r.CreatedAt,
 			})
 		}
-		endpoint = next
+		return nil
+	})
+	if err != nil {
+		if IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	return runs, nil
 }
 
 func (c *RESTClient) fetchFileContent(ctx context.Context, owner, repo, filePath, ref string) ([]byte, error) {
-	escapedPath := escapeRepoPath(filePath)
+	escapedPath, err := escapeRepoPath(filePath)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateRef(ref); err != nil {
+		return nil, err
+	}
 	endpoint := fmt.Sprintf("/repos/%s/%s/contents/%s", url.PathEscape(owner), url.PathEscape(repo), escapedPath)
 	if strings.TrimSpace(ref) != "" {
 		endpoint += "?ref=" + url.QueryEscape(ref)
@@ -464,60 +580,186 @@ func (c *RESTClient) fetchFileContent(ctx context.Context, owner, repo, filePath
 	return body, nil
 }
 
-func (c *RESTClient) get(ctx context.Context, endpointOrURL, accept string) ([]byte, string, error) {
-	fullURL := endpointOrURL
-	if !strings.HasPrefix(endpointOrURL, "http://") && !strings.HasPrefix(endpointOrURL, "https://") {
-		fullURL = c.baseURL + endpointOrURL
-	}
+func (c *RESTClient) getPaginated(ctx context.Context, startEndpoint, accept string, handlePage func([]byte) error) error {
+	endpoint := startEndpoint
+	visited := make(map[string]struct{})
+	for page := 0; endpoint != ""; page++ {
+		if page >= maxPaginationPages {
+			return fmt.Errorf("pagination exceeded maximum of %d pages", maxPaginationPages)
+		}
+		if _, seen := visited[endpoint]; seen {
+			return fmt.Errorf("pagination cycle detected at %s", endpoint)
+		}
+		visited[endpoint] = struct{}{}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+		body, next, err := c.get(ctx, endpoint, accept)
+		if err != nil {
+			return err
+		}
+		if err := handlePage(body); err != nil {
+			return err
+		}
+		endpoint = next
+	}
+	return nil
+}
+
+func (c *RESTClient) get(ctx context.Context, endpointOrURL, accept string) ([]byte, string, error) {
+	fullURL, err := c.resolveURL(endpointOrURL)
 	if err != nil {
 		return nil, "", security.SanitizeError(err, c.token.Expose())
-	}
-	req.Header.Set("Accept", accept)
-	req.Header.Set("X-GitHub-Api-Version", defaultAPIVersion)
-	req.Header.Set("User-Agent", c.userAgent)
-	if !c.token.IsEmpty() {
-		req.Header.Set("Authorization", "Bearer "+c.token.Expose())
 	}
 
 	cacheKey := accept + "|" + fullURL
 	c.mu.RLock()
 	cached, hasCached := c.cache[cacheKey]
 	c.mu.RUnlock()
+
+	headers := map[string]string{
+		"Accept": accept,
+	}
 	if hasCached && cached.etag != "" {
-		req.Header.Set("If-None-Match", cached.etag)
+		headers["If-None-Match"] = cached.etag
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, body, err := c.doRequest(ctx, http.MethodGet, fullURL, endpointOrURL, headers, nil, maxAPIResponseBytes)
 	if err != nil {
-		return nil, "", security.SanitizeError(err, c.token.Expose())
+		return nil, "", err
 	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", security.SanitizeError(err, c.token.Expose())
+	next, linkErr := c.extractValidatedNextLink(resp.Header.Get("Link"))
+	if linkErr != nil {
+		return nil, "", linkErr
 	}
 
 	if resp.StatusCode == http.StatusNotModified && hasCached {
-		return cached.body, parseNextLink(resp.Header.Get("Link")), nil
+		return cached.body, next, nil
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, "", parseAPIError(resp, endpointOrURL, body)
-	}
-
-	if etag := resp.Header.Get("ETag"); etag != "" {
+	if etag := resp.Header.Get("ETag"); etag != "" && len(body) <= maxCacheEntryBytes {
 		c.mu.Lock()
+		if len(c.cache) >= maxCacheEntries {
+			// Evict cache to keep memory strictly bounded on large org scans.
+			clear(c.cache)
+		}
 		c.cache[cacheKey] = cachedResponse{etag: etag, body: body}
 		c.mu.Unlock()
 	}
 
-	return body, parseNextLink(resp.Header.Get("Link")), nil
+	return body, next, nil
 }
 
-func parseAPIError(resp *http.Response, endpoint string, body []byte) error {
+func (c *RESTClient) doRequest(
+	ctx context.Context,
+	method string,
+	fullURL string,
+	endpointLabel string,
+	headers map[string]string,
+	payload []byte,
+	maxBytes int64,
+	extraSecrets ...string,
+) (*http.Response, []byte, error) {
+	if c.baseErr != nil {
+		return nil, nil, security.SanitizeError(c.baseErr, c.token.Expose())
+	}
+
+	var bodyReader io.Reader
+	if payload != nil {
+		bodyReader = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
+	if err != nil {
+		return nil, nil, security.SanitizeError(err, append(extraSecrets, c.token.Expose())...)
+	}
+	req.Header.Set("X-GitHub-Api-Version", defaultAPIVersion)
+	req.Header.Set("User-Agent", c.userAgent)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	if !c.token.IsEmpty() {
+		req.Header.Set("Authorization", "Bearer "+c.token.Expose())
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, nil, security.SanitizeError(err, append(extraSecrets, c.token.Expose())...)
+	}
+	defer resp.Body.Close()
+
+	body, err := readLimitedBody(resp.Body, maxBytes)
+	if err != nil {
+		return nil, nil, security.SanitizeError(err, append(extraSecrets, c.token.Expose())...)
+	}
+
+	if resp.StatusCode == http.StatusNotModified && method == http.MethodGet {
+		return resp, body, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, nil, parseAPIError(resp, endpointLabel, body, append(extraSecrets, c.token.Expose())...)
+	}
+	return resp, body, nil
+}
+
+func (c *RESTClient) resolveURL(endpointOrURL string) (string, error) {
+	if c.baseErr != nil {
+		return "", c.baseErr
+	}
+	if strings.HasPrefix(endpointOrURL, "http://") || strings.HasPrefix(endpointOrURL, "https://") {
+		u, err := url.Parse(endpointOrURL)
+		if err != nil {
+			return "", fmt.Errorf("invalid GitHub URL: %w", err)
+		}
+		if !sameOrigin(u, c.parsedBase) || u.User != nil {
+			return "", fmt.Errorf("refusing request to non-matching origin %s://%s", u.Scheme, u.Host)
+		}
+		if basePrefix := strings.TrimRight(c.parsedBase.Path, "/"); basePrefix != "" {
+			if u.Path != basePrefix && !strings.HasPrefix(u.Path, basePrefix+"/") {
+				return "", fmt.Errorf("refusing request outside API base path %q", basePrefix)
+			}
+		}
+		return u.String(), nil
+	}
+	if !strings.HasPrefix(endpointOrURL, "/") {
+		return "", fmt.Errorf("invalid relative API endpoint %q", endpointOrURL)
+	}
+	return c.baseURL + endpointOrURL, nil
+}
+
+func (c *RESTClient) extractValidatedNextLink(header string) (string, error) {
+	next := parseNextLink(header)
+	if next == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(next, "/") {
+		resolved := c.parsedBase.ResolveReference(&url.URL{Path: ""})
+		u, err := url.Parse(next)
+		if err != nil {
+			return "", fmt.Errorf("invalid pagination link: %w", err)
+		}
+		if strings.HasPrefix(next, "//") {
+			return "", errors.New("refusing protocol-relative pagination link")
+		}
+		next = resolved.ResolveReference(u).String()
+	}
+	validated, err := c.resolveURL(next)
+	if err != nil {
+		return "", fmt.Errorf("invalid pagination next link: %w", err)
+	}
+	return validated, nil
+}
+
+func readLimitedBody(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("HTTP response exceeded maximum allowed size of %d bytes", limit)
+	}
+	return data, nil
+}
+
+func parseAPIError(resp *http.Response, endpoint string, body []byte, secrets ...string) error {
 	var payload struct {
 		Message string `json:"message"`
 	}
@@ -539,8 +781,8 @@ func parseAPIError(resp *http.Response, endpoint string, body []byte) error {
 
 	return &APIError{
 		StatusCode:         resp.StatusCode,
-		Message:            payload.Message,
-		Endpoint:           endpoint,
+		Message:            security.SanitizeString(payload.Message, secrets...),
+		Endpoint:           security.SanitizeString(endpoint, secrets...),
 		RateLimitRemaining: remaining,
 		RateLimitReset:     resetAt,
 	}
@@ -557,10 +799,64 @@ func parseNextLink(header string) string {
 	return matches[1]
 }
 
-func escapeRepoPath(p string) string {
-	parts := strings.Split(strings.TrimLeft(p, "/"), "/")
-	for i := range parts {
-		parts[i] = url.PathEscape(parts[i])
+func sameOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
 	}
-	return strings.Join(parts, "/")
+	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
+}
+
+func validatePathSegment(kind, val string, allowSpaces bool) error {
+	if val == "" || strings.TrimSpace(val) == "" {
+		return fmt.Errorf("%s must not be empty", kind)
+	}
+	if val != strings.TrimSpace(val) {
+		return fmt.Errorf("invalid %s %q: leading or trailing whitespace is not allowed", kind, val)
+	}
+	if val == "." || val == ".." {
+		return fmt.Errorf("invalid %s %q: dot path segments are not allowed", kind, val)
+	}
+	for _, r := range val {
+		if r < 0x20 || r == 0x7f || r == '/' || r == '\\' || r == '?' || r == '#' || r == '%' {
+			return fmt.Errorf("invalid %s %q: contains disallowed character", kind, val)
+		}
+		if !allowSpaces && unicode.IsSpace(r) {
+			return fmt.Errorf("invalid %s %q: whitespace is not allowed", kind, val)
+		}
+	}
+	return nil
+}
+
+func validateRef(ref string) error {
+	if strings.TrimSpace(ref) == "" {
+		return nil
+	}
+	if ref != strings.TrimSpace(ref) || ref == "." || ref == ".." || strings.Contains(ref, "..") {
+		return fmt.Errorf("invalid git ref %q", ref)
+	}
+	for _, r := range ref {
+		if r < 0x20 || r == 0x7f || r == '\\' || r == '?' || r == '#' || unicode.IsSpace(r) {
+			return fmt.Errorf("invalid git ref %q", ref)
+		}
+	}
+	return nil
+}
+
+func escapeRepoPath(p string) (string, error) {
+	if p == "" || strings.HasPrefix(p, "/") || strings.HasPrefix(p, `\`) {
+		return "", fmt.Errorf("invalid repository file path %q", p)
+	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f || r == '\\' || r == '?' || r == '#' {
+			return "", fmt.Errorf("invalid repository file path %q", p)
+		}
+	}
+	parts := strings.Split(p, "/")
+	for i, seg := range parts {
+		if seg == "" || seg == "." || seg == ".." {
+			return "", fmt.Errorf("invalid repository file path %q: illegal segment %q", p, seg)
+		}
+		parts[i] = url.PathEscape(seg)
+	}
+	return strings.Join(parts, "/"), nil
 }

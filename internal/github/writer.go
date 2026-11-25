@@ -1,11 +1,9 @@
 package github
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -45,8 +43,8 @@ func (s *SecretStore) PreflightScope(ctx context.Context, scope rotate.StoreScop
 
 // UpdateSecret encrypts value locally with the target scope's public key and writes it to GitHub.
 func (s *SecretStore) UpdateSecret(ctx context.Context, scope rotate.StoreScope, name string, value *security.SensitiveBytes) error {
-	if strings.TrimSpace(name) == "" {
-		return fmt.Errorf("secret name must not be empty")
+	if err := validatePathSegment("secret name", name, false); err != nil {
+		return err
 	}
 	if value == nil || value.Len() == 0 {
 		return fmt.Errorf("secret value for %s must not be empty", name)
@@ -79,7 +77,7 @@ func (s *SecretStore) UpdateSecret(ctx context.Context, scope rotate.StoreScope,
 		return err
 	}
 
-	if err := s.client.putJSON(ctx, endpoint, bodyBytes); err != nil {
+	if err := s.client.putJSON(ctx, endpoint, bodyBytes, string(value.Expose())); err != nil {
 		return security.SanitizeError(err, s.client.token.Expose(), string(value.Expose()))
 	}
 	return nil
@@ -104,24 +102,41 @@ func (s *SecretStore) getPublicKey(ctx context.Context, scope rotate.StoreScope)
 	return pk, nil
 }
 
+func splitAndValidateRepo(raw string) (string, string, error) {
+	owner, repo, ok := strings.Cut(raw, "/")
+	if !ok || strings.Contains(repo, "/") {
+		return "", "", fmt.Errorf("invalid repository scope %q: expected owner/name", raw)
+	}
+	if err := validatePathSegment("owner", owner, false); err != nil {
+		return "", "", err
+	}
+	if err := validatePathSegment("repo", repo, false); err != nil {
+		return "", "", err
+	}
+	return owner, repo, nil
+}
+
 func publicKeyEndpoint(scope rotate.StoreScope) (string, error) {
 	switch scope.Scope {
 	case model.ScopeOrg:
-		if strings.TrimSpace(scope.Org) == "" {
-			return "", fmt.Errorf("org name is required for org scope")
+		if err := validatePathSegment("org", scope.Org, false); err != nil {
+			return "", err
 		}
 		return fmt.Sprintf("/orgs/%s/actions/secrets/public-key", url.PathEscape(scope.Org)), nil
 	case model.ScopeEnvironment:
-		owner, repo, ok := strings.Cut(scope.Repo, "/")
-		if !ok || owner == "" || repo == "" || strings.TrimSpace(scope.Environment) == "" {
-			return "", fmt.Errorf("invalid environment scope %q/%q", scope.Repo, scope.Environment)
+		owner, repo, err := splitAndValidateRepo(scope.Repo)
+		if err != nil {
+			return "", err
+		}
+		if err := validatePathSegment("environment", scope.Environment, true); err != nil {
+			return "", err
 		}
 		return fmt.Sprintf("/repos/%s/%s/environments/%s/secrets/public-key",
 			url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(scope.Environment)), nil
 	default:
-		owner, repo, ok := strings.Cut(scope.Repo, "/")
-		if !ok || owner == "" || repo == "" {
-			return "", fmt.Errorf("invalid repository scope %q", scope.Repo)
+		owner, repo, err := splitAndValidateRepo(scope.Repo)
+		if err != nil {
+			return "", err
 		}
 		return fmt.Sprintf("/repos/%s/%s/actions/secrets/public-key",
 			url.PathEscape(owner), url.PathEscape(repo)), nil
@@ -129,53 +144,45 @@ func publicKeyEndpoint(scope rotate.StoreScope) (string, error) {
 }
 
 func secretPutEndpoint(scope rotate.StoreScope, secretName string) (string, error) {
+	if err := validatePathSegment("secret name", secretName, false); err != nil {
+		return "", err
+	}
 	escapedName := url.PathEscape(secretName)
 	switch scope.Scope {
 	case model.ScopeOrg:
+		if err := validatePathSegment("org", scope.Org, false); err != nil {
+			return "", err
+		}
 		return fmt.Sprintf("/orgs/%s/actions/secrets/%s", url.PathEscape(scope.Org), escapedName), nil
 	case model.ScopeEnvironment:
-		owner, repo, ok := strings.Cut(scope.Repo, "/")
-		if !ok || owner == "" || repo == "" || strings.TrimSpace(scope.Environment) == "" {
-			return "", fmt.Errorf("invalid environment scope %q/%q", scope.Repo, scope.Environment)
+		owner, repo, err := splitAndValidateRepo(scope.Repo)
+		if err != nil {
+			return "", err
+		}
+		if err := validatePathSegment("environment", scope.Environment, true); err != nil {
+			return "", err
 		}
 		return fmt.Sprintf("/repos/%s/%s/environments/%s/secrets/%s",
 			url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(scope.Environment), escapedName), nil
 	default:
-		owner, repo, ok := strings.Cut(scope.Repo, "/")
-		if !ok || owner == "" || repo == "" {
-			return "", fmt.Errorf("invalid repository scope %q", scope.Repo)
+		owner, repo, err := splitAndValidateRepo(scope.Repo)
+		if err != nil {
+			return "", err
 		}
 		return fmt.Sprintf("/repos/%s/%s/actions/secrets/%s",
 			url.PathEscape(owner), url.PathEscape(repo), escapedName), nil
 	}
 }
 
-func (c *RESTClient) putJSON(ctx context.Context, endpoint string, payload []byte) error {
-	fullURL := c.baseURL + endpoint
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, fullURL, bytes.NewReader(payload))
+func (c *RESTClient) putJSON(ctx context.Context, endpoint string, payload []byte, extraSecrets ...string) error {
+	fullURL, err := c.resolveURL(endpoint)
 	if err != nil {
-		return security.SanitizeError(err, c.token.Expose())
+		return security.SanitizeError(err, append(extraSecrets, c.token.Expose())...)
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-GitHub-Api-Version", defaultAPIVersion)
-	req.Header.Set("User-Agent", c.userAgent)
-	if !c.token.IsEmpty() {
-		req.Header.Set("Authorization", "Bearer "+c.token.Expose())
+	headers := map[string]string{
+		"Accept":       "application/vnd.github+json",
+		"Content-Type": "application/json",
 	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return security.SanitizeError(err, c.token.Expose())
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return security.SanitizeError(err, c.token.Expose())
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return parseAPIError(resp, endpoint, body)
-	}
-	return nil
+	_, _, err = c.doRequest(ctx, http.MethodPut, fullURL, endpoint, headers, payload, maxWriteResponseBytes, extraSecrets...)
+	return err
 }
