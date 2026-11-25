@@ -3,6 +3,7 @@ package security
 import (
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 )
 
@@ -92,22 +93,22 @@ func (s *SensitiveBytes) Wipe() {
 }
 
 // String implements fmt.Stringer and always returns a redacted placeholder.
-func (s *SensitiveBytes) String() string {
+func (s SensitiveBytes) String() string {
 	return redactedPlaceholder
 }
 
 // GoString implements fmt.GoStringer and always returns a redacted placeholder.
-func (s *SensitiveBytes) GoString() string {
+func (s SensitiveBytes) GoString() string {
 	return redactedPlaceholder
 }
 
 // MarshalText implements encoding.TextMarshaler with redaction.
-func (s *SensitiveBytes) MarshalText() ([]byte, error) {
+func (s SensitiveBytes) MarshalText() ([]byte, error) {
 	return []byte(redactedPlaceholder), nil
 }
 
 // MarshalJSON implements json.Marshaler with redaction.
-func (s *SensitiveBytes) MarshalJSON() ([]byte, error) {
+func (s SensitiveBytes) MarshalJSON() ([]byte, error) {
 	return json.Marshal(redactedPlaceholder)
 }
 
@@ -116,24 +117,41 @@ func WipeBytes(b []byte) {
 	clear(b)
 }
 
+// SanitizeString scrubs any occurrences of the provided secret strings from text,
+// replacing longest secrets first to avoid leaving partial suffixes.
+func SanitizeString(text string, secrets ...string) string {
+	if text == "" || len(secrets) == 0 {
+		return text
+	}
+	ordered := make([]string, 0, len(secrets))
+	for _, s := range secrets {
+		if s != "" {
+			ordered = append(ordered, s)
+		}
+	}
+	if len(ordered) == 0 {
+		return text
+	}
+	slices.SortFunc(ordered, func(a, b string) int {
+		return len(b) - len(a)
+	})
+	for _, secret := range ordered {
+		if strings.Contains(text, secret) {
+			text = strings.ReplaceAll(text, secret, redactedPlaceholder)
+		}
+	}
+	return text
+}
+
 // SanitizeError scrubs any occurrences of the provided secret strings from err.
 func SanitizeError(err error, secrets ...string) error {
 	if err == nil {
 		return nil
 	}
 	msg := err.Error()
-	changed := false
-	for _, secret := range secrets {
-		if secret == "" {
-			continue
-		}
-		if strings.Contains(msg, secret) {
-			msg = strings.ReplaceAll(msg, secret, redactedPlaceholder)
-			changed = true
-		}
-	}
-	if !changed {
+	clean := SanitizeString(msg, secrets...)
+	if clean == msg {
 		return err
 	}
-	return errors.New(msg)
+	return errors.New(clean)
 }

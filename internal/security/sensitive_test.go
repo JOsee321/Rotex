@@ -59,6 +59,9 @@ func TestSensitiveBytesRedactionAndWipe(t *testing.T) {
 	if out := fmt.Sprintf("%v %#v", sb, sb); strings.Contains(out, "secret-material-xyz") {
 		t.Fatalf("SensitiveBytes leaked secret: %q", out)
 	}
+	if out := fmt.Sprintf("%v %+v %#v", *sb, *sb, *sb); strings.Contains(out, "secret-material-xyz") {
+		t.Fatalf("SensitiveBytes value formatting leaked secret: %q", out)
+	}
 
 	rawJSON, err := json.Marshal(sb)
 	if err != nil {
@@ -66,6 +69,10 @@ func TestSensitiveBytesRedactionAndWipe(t *testing.T) {
 	}
 	if string(rawJSON) != `"[REDACTED]"` {
 		t.Fatalf("unexpected JSON output: %s", rawJSON)
+	}
+	valJSON, err := json.Marshal(*sb)
+	if err != nil || string(valJSON) != `"[REDACTED]"` {
+		t.Fatalf("unexpected value JSON output: %s, err=%v", valJSON, err)
 	}
 
 	backing := sb.Expose()
@@ -93,5 +100,12 @@ func TestSanitizeError(t *testing.T) {
 	}
 	if !strings.Contains(sanitized.Error(), "[REDACTED]") {
 		t.Fatalf("expected [REDACTED] in sanitized error: %v", sanitized)
+	}
+
+	// Longest secret must be scrubbed before shorter prefix substrings.
+	overlapping := errors.New("leaked token ghp_secret_full_value in request")
+	clean := SanitizeError(overlapping, "ghp_secret", "ghp_secret_full_value")
+	if strings.Contains(clean.Error(), "_full_value") || strings.Contains(clean.Error(), "ghp_secret") {
+		t.Fatalf("overlapping secret left suffix behind: %v", clean)
 	}
 }
